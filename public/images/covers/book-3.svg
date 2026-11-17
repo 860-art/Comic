@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="400" viewBox="0 0 300 400">
+  <rect width="300" height="400" fill="#55688A"/>
+  <path d="M22 300 Q 75 280 128 300 T 234 300 T 340 300" fill="none" stroke="rgba(255,255,255,0.3)" stroke-width="3"/>
+  <path d="M22 330 Q 75 310 128 330 T 234 330 T 340 330" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="3"/>
+  <rect x="22" y="22" width="256" height="356" fill="none" stroke="rgba(255,255,255,0.4)" stroke-width="1.5"/>
+  <text x="150" y="185" text-anchor="middle" font-size="30" fill="#FFFFFF" font-family="serif">深海咖啡馆</text>
+  <text x="150" y="225" text-anchor="middle" font-size="14" fill="rgba(255,255,255,0.6)" font-family="serif">DEEP SEA CAFE</text>
+  <text x="150" y="330" text-anchor="middle" font-size="13" fill="rgba(255,255,255,0.7)" font-family="serif">苏晚</text>
+</svg>

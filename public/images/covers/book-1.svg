@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="400" viewBox="0 0 300 400">
+  <rect width="300" height="400" fill="#3E4C59"/>
+  <circle cx="60" cy="70" r="3" fill="rgba(255,255,255,0.8)"/>
+  <circle cx="120" cy="50" r="2" fill="rgba(255,255,255,0.6)"/>
+  <circle cx="230" cy="90" r="3" fill="rgba(255,255,255,0.7)"/>
+  <circle cx="180" cy="40" r="2" fill="rgba(255,255,255,0.5)"/>
+  <circle cx="250" cy="160" r="2" fill="rgba(255,255,255,0.6)"/>
+  <rect x="22" y="22" width="256" height="356" fill="none" stroke="rgba(255,255,255,0.4)" stroke-width="1.5"/>
+  <text x="150" y="200" text-anchor="middle" font-size="34" fill="#FFFFFF" font-family="serif">星尘旅人</text>
+  <text x="150" y="240" text-anchor="middle" font-size="14" fill="rgba(255,255,255,0.6)" font-family="serif">STARDUST TRAVELER</text>
+  <text x="150" y="330" text-anchor="middle" font-size="13" fill="rgba(255,255,255,0.7)" font-family="serif">林小满</text>
+</svg>

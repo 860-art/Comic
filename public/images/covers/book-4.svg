@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="400" viewBox="0 0 300 400">
+  <rect width="300" height="400" fill="#A03A38"/>
+  <path d="M0 400 L300 120 L300 200 L0 400 Z" fill="rgba(0,0,0,0.15)"/>
+  <rect x="22" y="22" width="256" height="356" fill="none" stroke="rgba(255,255,255,0.4)" stroke-width="1.5"/>
+  <text x="150" y="185" text-anchor="middle" font-size="32" fill="#FFFFFF" font-family="serif">热血高校</text>
+  <text x="150" y="230" text-anchor="middle" font-size="32" fill="#FFFFFF" font-family="serif">联盟</text>
+  <text x="150" y="330" text-anchor="middle" font-size="13" fill="rgba(255,255,255,0.7)" font-family="serif">张远航</text>
+</svg>

@@ -1,0 +1,1506 @@
+"""
+AoliComic 后端服务入口（FastAPI + SQLAlchemy + SQLite）。
+
+启动方式：
+    cd backend
+    uvicorn main:app --reload --port 8000
+
+- 数据库：本地 SQLite，首次启动自动在 backend/ 目录下生成 app.db
+- ORM：SQLAlchemy 2.0 风格（DeclarativeBase / Mapped / mapped_column）
+- 健康检查：GET /api/health -> {"status": "ok"}
+- 漫画列表：GET /api/comics -> JSON 数组（首次启动且表为空时自动插入前端展示的初始漫画）
+- 用户系统：POST /api/auth/register 注册（bcrypt 哈希）、POST /api/auth/login 登录（返回 7 天有效期 JWT）
+"""
+
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    inspect,
+    text,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+
+# ===== 数据库配置：SQLite 文件位于 backend/app.db =====
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE_URL = f"sqlite:///{BASE_DIR / 'app.db'}"
+
+# SQLite 需要关闭同线程检查（uvicorn 的线程池访问）
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+
+# ===== 认证配置 =====
+# JWT 签名密钥：开发用随机值；生产环境务必换成环境变量并保密
+SECRET_KEY = "aolicom-dev-secret-change-me-in-production"
+ALGORITHM = "HS256"
+TOKEN_EXPIRE_DAYS = 7  # Token 有效期：7 天
+
+# 密码哈希上下文：bcrypt
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+# ===== ORM 基类 =====
+class Base(DeclarativeBase):
+    pass
+
+
+# ===== 用户表：真实用户系统（替换前端 localStorage 假登录） =====
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(120), unique=True, index=True)
+    # bcrypt 哈希后的密码（绝不明文存储）
+    password_hash: Mapped[str | None] = mapped_column(String(128))
+    # 角色：'user' 普通用户 / 'admin' 管理员（启动时自动把 AO 提升为 admin）
+    role: Mapped[str] = mapped_column(String(20), default="user")
+    # ===== 用户资料（头像/背景可为 dataURL，用 Text 存储不受长度限制） =====
+    avatar_url: Mapped[str | None] = mapped_column(Text)
+    cover_url: Mapped[str | None] = mapped_column(Text)
+    signature: Mapped[str | None] = mapped_column(String(200))
+    gender: Mapped[str | None] = mapped_column(String(10))
+    birthday: Mapped[str | None] = mapped_column(String(20))
+    # 个人标签：JSON 数组字符串，如 '["悬疑", "热血"]'
+    tags: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ===== 帖子表：广场/空间动态（author_id 关联 users.id） =====
+class Post(Base):
+    __tablename__ = "posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    content: Mapped[str | None] = mapped_column(Text)
+    image_url: Mapped[str | None] = mapped_column(Text)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # 点赞计数：收到赞时 +1（防重复由 notifications 表的 like 记录保证）
+    likes: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # relationship：post.author.username 直接拿到作者用户名
+    author: Mapped["User"] = relationship("User")
+
+
+# ===== 待审核投稿表：用户投稿 → 管理员审核 → 正式 Comic =====
+class PendingComic(Base):
+    __tablename__ = "pending_comics"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(100), index=True)
+    author: Mapped[str] = mapped_column(String(50))
+    cover_url: Mapped[str | None] = mapped_column(Text)
+    # 标签以 JSON 数组字符串存储
+    tags: Mapped[str] = mapped_column(String(200), default="[]")
+    intro: Mapped[str | None] = mapped_column(Text)
+    need_translation: Mapped[bool] = mapped_column(Boolean, default=False)
+    submitter_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    # 待审核章节数据：JSON 数组字符串，如 '[{"title":"第1话","images":["data:..."]}]'
+    chapters: Mapped[str | None] = mapped_column(Text)
+    # 投稿类型：'new'=新建整本 / 'append'=为已有漫画追加章节
+    submit_type: Mapped[str] = mapped_column(String(20), default="new")
+    # 追加模式下的目标漫画 ID（new 模式为空）
+    target_comic_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    # 审核通过后生成的正式漫画 ID（『我的投稿』显示最终封面/书名用）
+    approved_comic_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # relationship：pending.submitter.username 直接拿到投稿人用户名
+    submitter: Mapped["User"] = relationship("User")
+
+
+# ===== 请求体模型 =====
+class RegisterRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ProfileUpdate(BaseModel):
+    """资料更新请求：所有字段均可选，只更新传入的字段。"""
+    avatar_url: str | None = None
+    cover_url: str | None = None
+    signature: str | None = None
+    tags: list[str] | None = None  # 个人标签数组；入库前序列化为 JSON 字符串
+    gender: str | None = None
+    birthday: str | None = None
+
+
+class CreatePostRequest(BaseModel):
+    """发帖请求：文字与图片至少一项。"""
+    content: str | None = None
+    image_url: str | None = None
+
+
+class ChapterInput(BaseModel):
+    """投稿的章节：章名 + 内页图片列表。"""
+    title: str = ""
+    images: list[str] = []
+
+
+class SubmitComicRequest(BaseModel):
+    """投稿请求：submit_type 必传（new=新建整本 / append=追加章节）。"""
+    title: str
+    author: str = ""
+    cover_url: str | None = None
+    tags: list[str] = []
+    intro: str | None = None
+    need_translation: bool = False
+    chapters: list[ChapterInput] = []
+    # 投稿类型：new / append（append 时 target_comic_id 必填）
+    submit_type: str = "new"
+    target_comic_id: int | None = None
+
+
+class ReviewRequest(BaseModel):
+    """审核请求：action 只能是 approve（通过）或 reject（驳回）。"""
+    action: str
+
+
+# ===== 漫画表：首页数据来源 =====
+class Comic(Base):
+    __tablename__ = "comics"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    author: Mapped[str] = mapped_column(String(50))
+    cover_image: Mapped[str] = mapped_column(String(500))
+    # 标签以 JSON 数组字符串存储，如 '["科幻", "热血"]'
+    tags: Mapped[str] = mapped_column(String(200), default="[]")
+    # 简介：投稿时填写的 intro；没写就是 NULL（前端显示『作者很懒，暂无简介』）
+    description: Mapped[str | None] = mapped_column(Text)
+    # 是否需要 AI 翻译（用户投稿时选择；原生漫画为 NULL → 前端默认显示翻译按钮）
+    need_translation: Mapped[bool | None] = mapped_column(Boolean)
+    # 投稿人 user.id（审核通过时写入，用于『我的投稿』查询；老数据为 NULL）
+    submitter_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    # 一部漫画包含多章（一对多）；审核发布的漫画才有章节
+    chapters: Mapped[list["Chapter"]] = relationship(
+        "Chapter", back_populates="comic", cascade="all, delete-orphan", order_by="Chapter.id"
+    )
+
+
+# ===== 章节表：一章属于一部漫画（多对一），内页以 JSON 字符串存储 =====
+class Chapter(Base):
+    __tablename__ = "chapters"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(100), default="第1话")
+    comic_id: Mapped[int] = mapped_column(ForeignKey("comics.id"), index=True)
+    # 章节内页图片 URL/dataURL 数组，如 '["data:image/png;base64,..."]'
+    images: Mapped[str] = mapped_column(Text, default="[]")
+    # relationship：chapter.comic.title 反查所属漫画
+    comic: Mapped["Comic"] = relationship("Comic", back_populates="chapters")
+
+
+# ===== 收藏表：用户 × 漫画 收藏关系（真实收藏数与收藏状态来源） =====
+class Collection(Base):
+    __tablename__ = "collections"
+    __table_args__ = (UniqueConstraint("user_id", "comic_id", name="uq_collection_user_comic"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # 收藏人
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # 被收藏的漫画
+    comic_id: Mapped[int] = mapped_column(ForeignKey("comics.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# 轻量迁移：旧版 users 表缺列时启动自动补列（这样已有的 app.db 不需要删除重建）
+_inspector = inspect(engine)
+if _inspector.has_table("users"):
+    _user_cols = {col["name"] for col in _inspector.get_columns("users")}
+    _add_column_sql = {
+        "email": "ALTER TABLE users ADD COLUMN email VARCHAR(120)",
+        "password_hash": "ALTER TABLE users ADD COLUMN password_hash VARCHAR(128)",
+        "avatar_url": "ALTER TABLE users ADD COLUMN avatar_url TEXT",
+        "cover_url": "ALTER TABLE users ADD COLUMN cover_url TEXT",
+        "signature": "ALTER TABLE users ADD COLUMN signature VARCHAR(200)",
+        "gender": "ALTER TABLE users ADD COLUMN gender VARCHAR(10)",
+        "birthday": "ALTER TABLE users ADD COLUMN birthday VARCHAR(20)",
+        "tags": "ALTER TABLE users ADD COLUMN tags TEXT DEFAULT '[]'",
+        "role": "ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'user'",
+    }
+    with engine.begin() as _conn:
+        for _col, _sql in _add_column_sql.items():
+            if _col not in _user_cols:
+                _conn.execute(text(_sql))
+
+# 旧版 comics 表缺 need_translation 列时自动补列
+if _inspector.has_table("comics"):
+    _comic_cols = {col["name"] for col in _inspector.get_columns("comics")}
+    with engine.begin() as _conn:
+        if "need_translation" not in _comic_cols:
+            _conn.execute(text("ALTER TABLE comics ADD COLUMN need_translation BOOLEAN"))
+
+# 旧版 pending_comics 表缺列时自动补列（chapters / submit_type / target_comic_id）
+if _inspector.has_table("pending_comics"):
+    _pc_cols = {col["name"] for col in _inspector.get_columns("pending_comics")}
+    _pc_new_cols = {
+        "chapters": "ALTER TABLE pending_comics ADD COLUMN chapters TEXT",
+        "submit_type": "ALTER TABLE pending_comics ADD COLUMN submit_type VARCHAR(20) DEFAULT 'new'",
+        "target_comic_id": "ALTER TABLE pending_comics ADD COLUMN target_comic_id INTEGER",
+    }
+    with engine.begin() as _conn:
+        for _col_name, _ddl in _pc_new_cols.items():
+            if _col_name not in _pc_cols:
+                _conn.execute(text(_ddl))
+
+# 旧版 posts 表缺 likes 列时自动补列
+if _inspector.has_table("posts"):
+    _post_cols = {col["name"] for col in _inspector.get_columns("posts")}
+    with engine.begin() as _conn:
+        if "likes" not in _post_cols:
+            _conn.execute(text("ALTER TABLE posts ADD COLUMN likes INTEGER DEFAULT 0"))
+
+# 旧版 comics 表缺 submitter_id（投稿人）列时自动补列
+if _inspector.has_table("comics"):
+    _comic_cols = {col["name"] for col in _inspector.get_columns("comics")}
+    with engine.begin() as _conn:
+        if "submitter_id" not in _comic_cols:
+            _conn.execute(text("ALTER TABLE comics ADD COLUMN submitter_id INTEGER"))
+        # 真实简介：投稿时写的 intro，老数据为 NULL
+        if "description" not in _comic_cols:
+            _conn.execute(text("ALTER TABLE comics ADD COLUMN description TEXT"))
+
+# 旧版 pending_comics 表缺 approved_comic_id 列时自动补列
+if _inspector.has_table("pending_comics"):
+    _pc_cols = {col["name"] for col in _inspector.get_columns("pending_comics")}
+    with engine.begin() as _conn:
+        if "approved_comic_id" not in _pc_cols:
+            _conn.execute(text("ALTER TABLE pending_comics ADD COLUMN approved_comic_id INTEGER"))
+
+# 旧版 notifications 表：post_id 为 NOT NULL（审核通知不属于帖子，需要可空）→ 重建表；
+# 同时补 is_read（未读红点）。SQLite 不支持改列约束，只能建新表搬数据。
+if _inspector.has_table("notifications"):
+    _noti_cols = {col["name"]: col for col in _inspector.get_columns("notifications")}
+    with engine.begin() as _conn:
+        if _noti_cols.get("post_id") is not None and not _noti_cols["post_id"]["nullable"]:
+            _conn.execute(text("ALTER TABLE notifications RENAME TO notifications_old"))
+            _conn.execute(
+                text(
+                    """
+                    CREATE TABLE notifications (
+                        id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                        type VARCHAR(20) NOT NULL,
+                        actor_id INTEGER NOT NULL REFERENCES users(id),
+                        recipient_id INTEGER NOT NULL REFERENCES users(id),
+                        post_id INTEGER REFERENCES posts(id),
+                        content TEXT,
+                        is_read BOOLEAN DEFAULT 0,
+                        created_at DATETIME NOT NULL
+                    )
+                    """
+                )
+            )
+            _conn.execute(
+                text(
+                    """
+                    INSERT INTO notifications (id, type, actor_id, recipient_id, post_id, content, created_at)
+                    SELECT id, type, actor_id, recipient_id, post_id, content, created_at
+                    FROM notifications_old
+                    """
+                )
+            )
+            _conn.execute(text("DROP TABLE notifications_old"))
+            _conn.execute(text("CREATE INDEX IF NOT EXISTS ix_notifications_type ON notifications (type)"))
+            _conn.execute(text("CREATE INDEX IF NOT EXISTS ix_notifications_actor_id ON notifications (actor_id)"))
+            _conn.execute(text("CREATE INDEX IF NOT EXISTS ix_notifications_recipient_id ON notifications (recipient_id)"))
+            _conn.execute(text("CREATE INDEX IF NOT EXISTS ix_notifications_post_id ON notifications (post_id)"))
+            print("[migrate] notifications 表已重建（post_id 可空 + is_read）")
+        elif "is_read" not in _noti_cols:
+            _conn.execute(text("ALTER TABLE notifications ADD COLUMN is_read BOOLEAN DEFAULT 0"))
+
+# 历史数据回填：老漫画的 description 为空时，用它对应投稿记录里真实填写的 intro 补上
+# （只回填真实投稿数据，绝不写入任何假简介）
+with SessionLocal() as _db:
+    _filled = 0
+    for _c in _db.query(Comic).filter(Comic.description.is_(None)).all():
+        _p = (
+            _db.query(PendingComic)
+            .filter(PendingComic.approved_comic_id == _c.id, PendingComic.intro.isnot(None))
+            .first()
+        )
+        if _p is not None and (_p.intro or "").strip():
+            _c.description = _p.intro.strip()
+            _filled += 1
+    if _filled:
+        _db.commit()
+        print(f"[migrate] 已用投稿简介回填 {_filled} 本漫画的 description")
+
+# 初始化逻辑：强制把用户名 AO 的账号提升为管理员（核心约定，每次启动都执行）
+with SessionLocal() as _db:
+    _ao = _db.query(User).filter(User.username == "AO").first()
+    if _ao is not None and _ao.role != "admin":
+        _ao.role = "admin"
+        _db.commit()
+        print("[init] 已把用户 AO 提升为管理员")
+
+# 注意：不再自动插入种子/假漫画。comics 表内容完全来自真实投稿审核与后续管理操作，
+# 数据库为空时前端展示『暂无漫画』空状态。
+
+# ===== 数据库会话依赖 =====
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_current_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> User:
+    """解析请求头 Authorization: Bearer <token>，返回当前登录用户。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未登录")
+    token = authorization[len("Bearer "):]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str | None = payload.get("sub")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token 无效或已过期")
+    if not username:
+        raise HTTPException(status_code=401, detail="Token 无效")
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    return user
+
+
+def get_optional_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> User | None:
+    """可选登录：带合法 Token 返回用户，未登录/Token 无效返回 None（不抛 401）。
+
+    用于「游客也能看，但登录用户额外拿到自己状态」的接口，如收藏数 + 我是否已收藏。
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization[len("Bearer "):]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str | None = payload.get("sub")
+    except JWTError:
+        return None
+    if not username:
+        return None
+    return db.query(User).filter(User.username == username).first()
+
+
+def user_profile(user: User) -> dict:
+    """把 User ORM 对象序列化为前端所需的资料 JSON（绝不含密码）。
+    tags 数据库中存 JSON 字符串，返回前必须解析成数组。"""
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "role": user.role,
+        "avatar_url": user.avatar_url,
+        "cover_url": user.cover_url,
+        "signature": user.signature,
+        "gender": user.gender,
+        "birthday": user.birthday,
+        "tags": json.loads(user.tags or "[]"),
+    }
+
+
+def pending_to_dict(p: PendingComic) -> dict:
+    """把 PendingComic ORM 对象序列化为前端所需的 JSON（relationship 带出投稿人）。"""
+    return {
+        "id": p.id,
+        "title": p.title,
+        "author": p.author,
+        "cover_url": p.cover_url,
+        "tags": json.loads(p.tags or "[]"),
+        "intro": p.intro,
+        "need_translation": bool(p.need_translation),
+        "submitter_id": p.submitter_id,
+        "submitter_username": p.submitter.username,
+        "status": p.status,
+        "chapters": json.loads(p.chapters or "[]"),
+        "submit_type": p.submit_type or "new",
+        "target_comic_id": p.target_comic_id,
+        "created_at": p.created_at.replace(tzinfo=timezone.utc).isoformat(),
+    }
+
+
+def require_admin(user: User = Depends(get_current_user)) -> User:
+    """管理员权限校验：role != 'admin' 直接 403。"""
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="无权限：需要管理员账号")
+    return user
+
+
+def post_to_dict(post: Post) -> dict:
+    """把 Post ORM 对象序列化为前端所需的 JSON（relationship 带出作者用户名）。
+
+    created_at 在库里以 naive UTC 存储，序列化时补上 Z 后缀（ISO UTC），
+    浏览器 new Date() 会自动换算为用户本地时区，避免出现"8小时前"时区偏差。
+    """
+    return {
+        "id": post.id,
+        "content": post.content,
+        "image_url": post.image_url,
+        "author_id": post.author_id,
+        "author_username": post.author.username,
+        "likes": post.likes,
+        "created_at": post.created_at.replace(tzinfo=timezone.utc).isoformat(),
+    }
+
+
+# ===== FastAPI 应用 =====
+app = FastAPI(title="AoliComic Backend", version="0.1.0")
+
+# ===== 跨域配置：开发阶段先允许所有来源（必须在路由定义之前添加） =====
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 开发阶段：允许所有来源
+    allow_credentials=True,
+    allow_methods=["*"],  # 全部请求方法
+    allow_headers=["*"],  # 全部请求头
+)
+
+# ===== OCR 漫画翻译（PaddleOCR + OpenCV 取色 + GLM/DeepSeek），详见 ocr_translate.py =====
+from ocr_translate import router as translate_router  # noqa: E402
+
+app.include_router(translate_router)
+
+
+@app.get("/api/health")
+def health(db: Session = Depends(get_db)):
+    """健康检查：同时验证 SQLite 连接可用（users 表可查询）。"""
+    user_count = db.query(User).count()
+    return {"status": "ok"}
+
+
+@app.get("/api/db-check")
+def db_check(db: Session = Depends(get_db)):
+    """数据库连通性示例：返回 users 表行数，证明 ORM 与 app.db 工作正常。"""
+    user_count = db.query(User).count()
+    return {"status": "ok", "database": "app.db", "users_count": user_count}
+
+
+@app.get("/api/tags")
+def get_tags(db: Session = Depends(get_db)):
+    """标签聚合接口：收集所有已上架漫画的标签，去重后返回（首项固定『全部』）。"""
+    comics = db.query(Comic).all()
+    tag_set: set[str] = set()
+    for c in comics:
+        for tag in json.loads(c.tags or "[]"):
+            tag = (tag or "").strip()
+            if tag:
+                tag_set.add(tag)
+    # 『全部』放最前，其余按名称排序保证稳定
+    return {"tags": ["全部"] + sorted(tag_set)}
+
+
+@app.get("/api/comics")
+def get_comics(db: Session = Depends(get_db)):
+    """漫画列表接口：从数据库查询全部漫画，返回 JSON 数组（含 AI 翻译标记）。"""
+    comics = db.query(Comic).order_by(Comic.id).all()
+    return [
+        {
+            "id": c.id,
+            "title": c.title,
+            "author": c.author,
+            "coverImage": c.cover_image,
+            "tags": json.loads(c.tags or "[]"),
+            "needTranslation": c.need_translation,
+            # 章节列表：id 格式 "{comicId}-{chapterId}"，pages = 内页数量
+            "chapters": [
+                {
+                    "id": f"{c.id}-{ch.id}",
+                    "title": ch.title,
+                    "pages": len(json.loads(ch.images or "[]")),
+                }
+                for ch in c.chapters
+            ],
+        }
+        for c in comics
+    ]
+
+
+@app.get("/api/collections")
+def list_my_collections(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """我的书架：当前 Token 用户真实收藏的漫画列表（按收藏时间倒序）。
+
+    - 必须登录：未登录 401
+    - 只查 collections 表中 user_id == 当前用户 的记录，join comics 取真实书籍信息
+    - 不再依赖前端 localStorage 的假数据，返回空数组时前端显示空状态
+    """
+    rows = (
+        db.query(Comic)
+        .join(Collection, Collection.comic_id == Comic.id)
+        .filter(Collection.user_id == user.id)
+        .order_by(Collection.id.desc())
+        .all()
+    )
+    return [
+        {
+            "id": c.id,
+            "title": c.title,
+            "author": c.author,
+            "coverImage": c.cover_image,
+            "tags": json.loads(c.tags or "[]"),
+            "description": c.description,
+            # 真实收藏总数（这本书被多少人收藏）
+            "favorites": db.query(Collection).filter(Collection.comic_id == c.id).count(),
+            "chapters": [
+                {
+                    "id": f"{c.id}-{ch.id}",
+                    "title": ch.title,
+                    "pages": len(json.loads(ch.images or "[]")),
+                }
+                for ch in c.chapters
+            ],
+        }
+        for c in rows
+    ]
+
+
+# ===== 评论表：一条评论属于一部漫画，作者关联 User 表 =====
+class Comment(Base):
+    __tablename__ = "comments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    content: Mapped[str] = mapped_column(Text)
+    comic_id: Mapped[int] = mapped_column(ForeignKey("comics.id"), index=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # relationship：评论.author.username / 评论.author.avatar_url 反查发评论人
+    author: Mapped["User"] = relationship("User")
+
+
+def comment_to_dict(c: Comment) -> dict:
+    """把 Comment ORM 对象序列化：带出真实用户名与头像。"""
+    return {
+        "id": c.id,
+        "content": c.content,
+        "comic_id": c.comic_id,
+        "author_id": c.author_id,
+        "author_username": c.author.username,
+        "avatar_url": c.author.avatar_url,
+        "created_at": c.created_at.replace(tzinfo=timezone.utc).isoformat(),
+    }
+
+
+# ===== 公告表：管理员发布，通知中心展示 =====
+class Announcement(Base):
+    __tablename__ = "announcements"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(100))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+def announcement_to_dict(a: Announcement) -> dict:
+    """把 Announcement ORM 对象序列化为前端所需 JSON。"""
+    return {
+        "id": a.id,
+        "title": a.title,
+        "content": a.content,
+        "created_at": a.created_at.replace(tzinfo=timezone.utc).isoformat(),
+    }
+
+
+class AnnouncementRequest(BaseModel):
+    """发布公告请求：标题与正文必填。"""
+    title: str
+    content: str
+
+
+# ===== 互动通知表：帖子点赞 / 评论时产生，recipient 收到后通知中心展示 =====
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # 通知类型：like=赞了动态 / comment=评论了动态 / review=投稿审核结果
+    type: Mapped[str] = mapped_column(String(20), index=True)
+    # 触发互动的用户（审核通知为管理员账号）
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # 收到通知的用户（动态作者 / 投稿人）
+    recipient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # 关联的帖子（审核类通知为空）
+    post_id: Mapped[int | None] = mapped_column(ForeignKey("posts.id"), index=True)
+    # 评论内容 / 审核结果文案（like 类型为空）
+    content: Mapped[str | None] = mapped_column(Text)
+    # 是否已读：导航栏铃铛红点按未读数判断
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    actor: Mapped["User"] = relationship("User", foreign_keys=[actor_id])
+
+
+def notification_to_dict(n: Notification) -> dict:
+    """把 Notification ORM 对象序列化：带出触发者真实用户名与头像。"""
+    return {
+        "id": n.id,
+        "type": n.type,
+        "actor_id": n.actor_id,
+        "actor_username": n.actor.username,
+        "actor_avatar": n.actor.avatar_url,
+        "recipient_id": n.recipient_id,
+        "post_id": n.post_id,
+        "content": n.content,
+        "is_read": bool(n.is_read),
+        "created_at": n.created_at.replace(tzinfo=timezone.utc).isoformat(),
+    }
+
+
+# 首次启动自动建表（生成 app.db）——必须在所有 ORM 模型定义之后调用，
+# 否则后定义的模型（如 comments 表）不会被创建
+Base.metadata.create_all(bind=engine)
+
+# ===== 官方公告 =====
+@app.get("/api/announcements")
+def list_announcements(db: Session = Depends(get_db)):
+    """全部公告：按发布时间倒序（最新在前）。"""
+    rows = db.query(Announcement).order_by(Announcement.id.desc()).all()
+    return [announcement_to_dict(a) for a in rows]
+
+
+@app.post("/api/admin/announcements")
+def create_announcement(
+    req: AnnouncementRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """发布公告：严格校验 Token，只有 role == 'admin' 才能调用（403）。"""
+    title = (req.title or "").strip()
+    content = (req.content or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="公告标题不能为空")
+    if not content:
+        raise HTTPException(status_code=400, detail="公告内容不能为空")
+    ann = Announcement(title=title, content=content)
+    db.add(ann)
+    db.commit()
+    db.refresh(ann)
+    return {"message": "公告发布成功", "announcement": announcement_to_dict(ann)}
+
+
+@app.delete("/api/announcements/{announcement_id}")
+def delete_announcement(
+    announcement_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """撤销官方公告：仅管理员（403）。
+
+    公告是**全站公开**数据，删除后所有用户的通知中心都不再出现（官方撤销）。
+    """
+    ann = db.query(Announcement).filter(Announcement.id == announcement_id).first()
+    if ann is None:
+        raise HTTPException(status_code=404, detail="公告不存在")
+    db.delete(ann)
+    db.commit()
+    return {"message": "公告已撤销", "id": announcement_id}
+
+
+# ===== 漫画详情 / 章节内页 =====
+@app.get("/api/comics/my-submissions")
+def my_submissions(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """我的投稿记录：当前登录用户提交的全部稿件（待审核/已通过/已驳回），时间倒序。
+    注意：本路由必须声明在 /api/comics/{comic_id} 之前，否则会被路径参数吞掉。"""
+    rows = (
+        db.query(PendingComic)
+        .filter(PendingComic.submitter_id == user.id)
+        .order_by(PendingComic.id.desc())
+        .all()
+    )
+    result = []
+    for p in rows:
+        title = p.title or ""
+        cover = p.cover_url
+        # 已通过：书名/封面取正式漫画库的最终数据
+        if p.status == "approved" and p.approved_comic_id:
+            comic = db.query(Comic).filter(Comic.id == p.approved_comic_id).first()
+            if comic is not None:
+                title = comic.title
+                cover = comic.cover_image or cover
+        elif (p.submit_type or "new") == "append" and p.target_comic_id:
+            # 追加章节投稿：书名/封面取目标漫画（投稿本身不带整本书信息）
+            target = db.query(Comic).filter(Comic.id == p.target_comic_id).first()
+            if target is not None:
+                if not title:
+                    title = target.title
+                cover = cover or target.cover_image
+        result.append(
+            {
+                "id": p.id,
+                "title": title,
+                "cover_url": cover,
+                "status": p.status or "pending",
+                "submit_type": p.submit_type or "new",
+                "created_at": p.created_at.replace(tzinfo=timezone.utc).isoformat(),
+            }
+        )
+    return result
+
+
+@app.get("/api/comics/{comic_id}")
+def get_comic_detail(
+    comic_id: int,
+    db: Session = Depends(get_db),
+    viewer: User | None = Depends(get_optional_user),
+):
+    """单本漫画详情：基本信息 + 真实简介 + 真实收藏数 + 真实章节列表（不含内页大图）。"""
+    comic = db.query(Comic).filter(Comic.id == comic_id).first()
+    if comic is None:
+        raise HTTPException(status_code=404, detail="漫画不存在")
+    favorite_count = db.query(Collection).filter(Collection.comic_id == comic.id).count()
+    collected = False
+    if viewer is not None:
+        collected = (
+            db.query(Collection)
+            .filter(Collection.comic_id == comic.id, Collection.user_id == viewer.id)
+            .first()
+            is not None
+        )
+    return {
+        "id": comic.id,
+        "title": comic.title,
+        "author": comic.author,
+        "coverImage": comic.cover_image,
+        "tags": json.loads(comic.tags or "[]"),
+        # 真实简介：没有就是 None，前端显示『作者很懒，暂无简介』
+        "description": comic.description,
+        "needTranslation": comic.need_translation,
+        # 真实收藏数（collections 表统计）与当前用户是否已收藏
+        "favorites": favorite_count,
+        "collected": collected,
+        "chapters": [
+            {
+                "id": f"{comic.id}-{ch.id}",
+                "title": ch.title,
+                "pages": len(json.loads(ch.images or "[]")),
+            }
+            for ch in comic.chapters
+        ],
+    }
+
+
+@app.get("/api/comics/{comic_id}/collection")
+def get_collection_state(
+    comic_id: int,
+    db: Session = Depends(get_db),
+    viewer: User | None = Depends(get_optional_user),
+):
+    """收藏状态 + 真实收藏总数（游客也能拿到总数）。"""
+    if db.query(Comic).filter(Comic.id == comic_id).first() is None:
+        raise HTTPException(status_code=404, detail="漫画不存在")
+    count = db.query(Collection).filter(Collection.comic_id == comic_id).count()
+    collected = False
+    if viewer is not None:
+        collected = (
+            db.query(Collection)
+            .filter(Collection.comic_id == comic_id, Collection.user_id == viewer.id)
+            .first()
+            is not None
+        )
+    return {"comic_id": comic_id, "count": count, "collected": collected}
+
+
+@app.post("/api/comics/{comic_id}/collect")
+def collect_comic(
+    comic_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """收藏：真实写入 collections 表（幂等，重复收藏不报错）。"""
+    if db.query(Comic).filter(Comic.id == comic_id).first() is None:
+        raise HTTPException(status_code=404, detail="漫画不存在")
+    exists = (
+        db.query(Collection)
+        .filter(Collection.comic_id == comic_id, Collection.user_id == user.id)
+        .first()
+    )
+    if exists is None:
+        db.add(Collection(comic_id=comic_id, user_id=user.id))
+        db.commit()
+    count = db.query(Collection).filter(Collection.comic_id == comic_id).count()
+    return {"message": "已收藏", "collected": True, "count": count}
+
+
+@app.delete("/api/comics/{comic_id}/collect")
+def uncollect_comic(
+    comic_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """取消收藏：从 collections 表删除对应记录（幂等）。"""
+    if db.query(Comic).filter(Comic.id == comic_id).first() is None:
+        raise HTTPException(status_code=404, detail="漫画不存在")
+    db.query(Collection).filter(
+        Collection.comic_id == comic_id, Collection.user_id == user.id
+    ).delete(synchronize_session=False)
+    db.commit()
+    count = db.query(Collection).filter(Collection.comic_id == comic_id).count()
+    return {"message": "已取消收藏", "collected": False, "count": count}
+
+
+@app.delete("/api/comics/{comic_id}")
+def delete_comic(
+    comic_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """管理员专属：删除漫画。
+
+    严格权限校验：Authorization: Bearer <token> → 查询用户 → role != 'admin' 直接 403。
+    级联清理：手动删除收藏记录（Collection 无 relationship），
+    章节（Chapter）由 Comic.chapters 的 cascade="all, delete-orphan" 自动删除，不留孤儿数据。
+    """
+    comic = db.query(Comic).filter(Comic.id == comic_id).first()
+    if comic is None:
+        raise HTTPException(status_code=404, detail="漫画不存在")
+    title = comic.title
+    # 级联删除该漫画的所有收藏记录
+    removed_collections = (
+        db.query(Collection)
+        .filter(Collection.comic_id == comic_id)
+        .delete(synchronize_session=False)
+    )
+    # 删除漫画本身（chapters 级联自动删除）
+    db.delete(comic)
+    db.commit()
+    print(
+        f"[admin] 管理员 {admin.username} 删除了漫画 #{comic_id}《{title}》"
+        f"（级联清理收藏 {removed_collections} 条）"
+    )
+    return {"message": "删除成功", "comic_id": comic_id}
+
+
+class TagsUpdateRequest(BaseModel):
+    """标签更新请求体：完整的新标签数组（去重后写库）。"""
+
+    tags: list[str] = []
+
+
+@app.put("/api/comics/{comic_id}/tags")
+def update_comic_tags(
+    comic_id: int,
+    req: TagsUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """更新漫画标签。
+
+    权限规则：
+    - 新增标签（新数组包含旧数组没有的标签）：任意登录用户可操作
+    - 删除标签（新数组比旧数组少）：**仅管理员**，否则 403
+    """
+    comic = db.query(Comic).filter(Comic.id == comic_id).first()
+    if comic is None:
+        raise HTTPException(status_code=404, detail="漫画不存在")
+
+    old_tags = [t for t in json.loads(comic.tags or "[]") if t]
+    # 清洗：去空、去首尾空格、去掉 # 前缀、去重、限长
+    cleaned: list[str] = []
+    for raw in req.tags:
+        tag = (raw or "").strip().lstrip("#").strip()
+        if not tag:
+            continue
+        if len(tag) > 12:
+            raise HTTPException(status_code=400, detail="单个标签不能超过 12 个字")
+        if tag not in cleaned:
+            cleaned.append(tag)
+    if len(cleaned) > 10:
+        raise HTTPException(status_code=400, detail="标签最多 10 个")
+
+    removed = [t for t in old_tags if t not in cleaned]
+    if removed and user.role != "admin":
+        raise HTTPException(status_code=403, detail="无权限：只有管理员可以删除标签")
+
+    comic.tags = json.dumps(cleaned, ensure_ascii=False)
+    db.commit()
+
+    # 全站标签：更新后重新聚合去重（分类页直接刷新即可拿到最新标签栏）
+    all_tags: set[str] = set()
+    for c in db.query(Comic).all():
+        for t in json.loads(c.tags or "[]"):
+            t = (t or "").strip()
+            if t:
+                all_tags.add(t)
+    return {
+        "message": "标签已更新",
+        "comic_id": comic.id,
+        "tags": cleaned,
+        "removed": removed,
+        "all_tags": ["全部"] + sorted(all_tags),
+    }
+
+
+@app.get("/api/comics/{comic_id}/chapters/{chapter_id}")
+def get_chapter_images(comic_id: int, chapter_id: int, db: Session = Depends(get_db)):
+    """单章内页：阅读页根据章节 ID 只加载这一话的图片。"""
+    ch = (
+        db.query(Chapter)
+        .filter(Chapter.id == chapter_id, Chapter.comic_id == comic_id)
+        .first()
+    )
+    if ch is None:
+        raise HTTPException(status_code=404, detail="章节不存在")
+    return {
+        "id": f"{comic_id}-{ch.id}",
+        "comic_id": comic_id,
+        "title": ch.title,
+        "images": json.loads(ch.images or "[]"),
+    }
+
+
+# ===== 漫画评论 =====
+@app.get("/api/comics/{comic_id}/comments")
+def get_comic_comments(comic_id: int, db: Session = Depends(get_db)):
+    """某本漫画的全部真实评论（新→旧），relationship 带出发评论人用户名与头像。"""
+    if db.query(Comic).filter(Comic.id == comic_id).first() is None:
+        raise HTTPException(status_code=404, detail="漫画不存在")
+    comments = (
+        db.query(Comment)
+        .filter(Comment.comic_id == comic_id)
+        .order_by(Comment.id.desc())
+        .all()
+    )
+    return [comment_to_dict(c) for c in comments]
+
+
+@app.post("/api/comics/{comic_id}/comments")
+def create_comic_comment(
+    comic_id: int,
+    body: dict,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """发表评论：校验 Token，存库后返回带真实用户名/头像的完整评论。"""
+    if db.query(Comic).filter(Comic.id == comic_id).first() is None:
+        raise HTTPException(status_code=404, detail="漫画不存在")
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="评论内容不能为空")
+    if len(content) > 500:
+        raise HTTPException(status_code=400, detail="评论内容不能超过 500 字")
+    comment = Comment(content=content, comic_id=comic_id, author_id=user.id)
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return {"message": "评论发表成功", "comment": comment_to_dict(comment)}
+
+
+# ===== 投稿 / 管理员审核 =====
+@app.post("/api/comics/submit")
+def submit_comic(
+    req: SubmitComicRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """投稿：校验 Token，把当前登录用户作为投稿人，写入 pending_comics（status=pending）。"""
+    # 投稿类型校验：new / append；append 时必须给出目标漫画且目标必须存在
+    submit_type = (req.submit_type or "new").strip().lower()
+    if submit_type not in ("new", "append"):
+        raise HTTPException(status_code=400, detail="submit_type 只能是 new 或 append")
+    if submit_type == "append":
+        if req.target_comic_id is None:
+            raise HTTPException(status_code=400, detail="追加章节时必须指定 target_comic_id")
+        target = db.query(Comic).filter(Comic.id == req.target_comic_id).first()
+        if target is None:
+            raise HTTPException(status_code=400, detail="目标漫画不存在")
+    if not req.title.strip() and submit_type == "new":
+        raise HTTPException(status_code=400, detail="书名不能为空")
+    if not req.cover_url and submit_type == "new":
+        raise HTTPException(status_code=400, detail="请上传封面图")
+    title = req.title.strip()
+
+    # 章节数据一并入库（JSON 字符串）：空标题自动补“第N话”
+    # 追加模式的序号接着目标漫画已有章节数往后排（如已有 2 章 → 新章从“第3话”起）
+    chapter_offset = len(target.chapters) if submit_type == "append" else 0
+    chapters_data = [
+        {
+            "title": (ch.title or "").strip() or f"第{chapter_offset + i + 1}话",
+            "images": ch.images,
+        }
+        for i, ch in enumerate(req.chapters)
+        if ch.images  # 无内页的空章节丢弃
+    ]
+    # 追加模式没有独立书名/封面时，沿用目标漫画的信息便于审核台展示
+    pending = PendingComic(
+        title=title or (target.title if submit_type == "append" else ""),
+        author=req.author.strip() or user.username,
+        cover_url=req.cover_url or (target.cover_image if submit_type == "append" else None),
+        tags=json.dumps(req.tags, ensure_ascii=False),
+        intro=(req.intro or "").strip() or None,
+        need_translation=req.need_translation,
+        submitter_id=user.id,
+        status="pending",
+        chapters=json.dumps(chapters_data, ensure_ascii=False) if chapters_data else None,
+        submit_type=submit_type,
+        target_comic_id=req.target_comic_id if submit_type == "append" else None,
+    )
+    db.add(pending)
+    db.commit()
+    db.refresh(pending)
+    return {"message": "投稿成功！请耐心等待管理员审核", "comic": pending_to_dict(pending)}
+
+
+@app.get("/api/admin/pending")
+def admin_pending_list(
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """管理员获取待审核列表：非管理员账号 403。"""
+    rows = (
+        db.query(PendingComic)
+        .filter(PendingComic.status == "pending")
+        .order_by(PendingComic.id.desc())
+        .all()
+    )
+    return [pending_to_dict(p) for p in rows]
+
+
+@app.post("/api/admin/comics/{comic_id}/review")
+def review_comic(
+    comic_id: int,
+    req: ReviewRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """管理员审核：approve 复制进正式 Comic 表；reject 标记驳回。
+    两种结果都保留待审核记录（供『我的投稿』查询）并给投稿人写一条审核通知。"""
+    if req.action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action 必须是 approve 或 reject")
+
+    pending = db.query(PendingComic).filter(PendingComic.id == comic_id).first()
+    if pending is None:
+        raise HTTPException(status_code=404, detail="待审核记录不存在")
+
+    if req.action == "approve":
+        # 用投稿类型区分处理：new 新建整本 / append 追加章节到已有漫画
+        submit_type = pending.submit_type or "new"
+        if submit_type == "append":
+            # ===== 追加模式：不新建漫画，把新章节挂到 target_comic_id 下 =====
+            target = db.query(Comic).filter(Comic.id == pending.target_comic_id).first()
+            if target is None:
+                raise HTTPException(status_code=400, detail="目标漫画不存在，无法追加章节")
+            # 章节序号接在已有章节之后（空标题自动补“第N话”）
+            offset = len(target.chapters)
+            added_chapters = []
+            for idx, ch in enumerate(json.loads(pending.chapters or "[]"), start=1):
+                chapter = Chapter(
+                    title=ch.get("title") or f"第{offset + idx}话",
+                    comic_id=target.id,
+                    images=json.dumps(ch.get("images") or [], ensure_ascii=False),
+                )
+                db.add(chapter)
+                added_chapters.append(chapter)
+            # 保留投稿记录：标记已通过（不删除，供『我的投稿』展示）
+            pending.status = "approved"
+            pending.approved_comic_id = target.id
+            # 给投稿人写审核通知（红点依赖未读状态）
+            db.add(
+                Notification(
+                    type="review",
+                    actor_id=admin.id,
+                    recipient_id=pending.submitter_id,
+                    post_id=None,
+                    content=f"你为《{target.title}》提交的 {len(added_chapters)} 个新章节已审核通过",
+                )
+            )
+            db.commit()
+            db.refresh(target)  # 刷新 relationship，让返回的章节列表包含新章
+            return {
+                "message": f"已通过！{len(added_chapters)} 个章节已追加到《{target.title}》",
+                "comic_id": target.id,
+                "chapters": [
+                    {"id": f"{target.id}-{ch.id}", "title": ch.title, "pages": len(json.loads(ch.images or "[]"))}
+                    for ch in target.chapters
+                ],
+            }
+        # ===== 新建模式：整本漫画 + 章节一起入库 =====
+        # 正式表 title 唯一：避免重复审核同名作品导致 500
+        exists = db.query(Comic).filter(Comic.title == pending.title).first()
+        if exists:
+            raise HTTPException(status_code=400, detail="正式漫画库中已存在同名作品")
+        comic = Comic(
+            title=pending.title,
+            author=pending.author,
+            cover_image=pending.cover_url or "",
+            tags=pending.tags,  # 已是 JSON 字符串，直接复用
+            # 投稿时填写的简介原样带入（没填 → None，前端显示『作者很懒，暂无简介』）
+            description=(pending.intro or "").strip() or None,
+            need_translation=pending.need_translation,
+            submitter_id=pending.submitter_id,  # 记录投稿人，供『我的投稿』查询
+        )
+        db.add(comic)
+        db.flush()  # 先拿到 comic.id，章节外键要用
+        # 待审核的章节数据真实写入 Chapter 表（一对多）
+        for idx, ch in enumerate(json.loads(pending.chapters or "[]"), start=1):
+            db.add(
+                Chapter(
+                    title=ch.get("title") or f"第{idx}话",
+                    comic_id=comic.id,
+                    images=json.dumps(ch.get("images") or [], ensure_ascii=False),
+                )
+            )
+        # 保留投稿记录：标记已通过（不删除，供『我的投稿』展示）
+        pending.status = "approved"
+        pending.approved_comic_id = comic.id
+        # 给投稿人写审核通知
+        db.add(
+            Notification(
+                type="review",
+                actor_id=admin.id,
+                recipient_id=pending.submitter_id,
+                post_id=None,
+                content=f"你的作品《{pending.title}》审核通过，已上架漫画库",
+            )
+        )
+        db.commit()
+        db.refresh(comic)
+        return {
+            "message": "已通过并发布！",
+            "comic_id": comic.id,
+            "chapters": [
+                {"id": f"{comic.id}-{ch.id}", "title": ch.title, "pages": len(json.loads(ch.images or "[]"))}
+                for ch in comic.chapters
+            ],
+        }
+
+    # reject：标记驳回（保留记录供『我的投稿』展示已驳回状态）并通知投稿人
+    pending.status = "rejected"
+    db.add(
+        Notification(
+            type="review",
+            actor_id=admin.id,
+            recipient_id=pending.submitter_id,
+            post_id=None,
+            content=f"你的作品《{pending.title}》审核未通过，可修改后重新投稿",
+        )
+    )
+    db.commit()
+    return {"message": "已驳回"}
+
+
+# ===== 用户系统：注册 / 登录 =====
+@app.post("/api/auth/register")
+def register(req: RegisterRequest, db: Session = Depends(get_db)):
+    """注册：检查用户名/邮箱唯一性 → bcrypt 哈希密码 → 入库（不返回密码）。"""
+    username = req.username.strip()
+    email = req.email.strip().lower()
+    # 基础校验
+    if not username or not email or not req.password:
+        raise HTTPException(status_code=400, detail="用户名、邮箱和密码均不能为空")
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="密码长度至少 6 位")
+
+    # 唯一性检查：用户名或邮箱已存在 → 400
+    exists = (
+        db.query(User)
+        .filter((User.username == username) | (User.email == email))
+        .first()
+    )
+    if exists:
+        field = "用户名" if exists.username == username else "邮箱"
+        raise HTTPException(status_code=400, detail=f"{field}已被注册")
+
+    user = User(
+        username=username,
+        email=email,
+        password_hash=pwd_context.hash(req.password),  # bcrypt 哈希，绝不存明文
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {"message": "注册成功", "user": {"id": user.id, "username": user.username}}
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    """登录：校验密码 → 生成 7 天有效期的 JWT Token 返回给前端。"""
+    user = db.query(User).filter(User.username == req.username.strip()).first()
+    # 用户不存在或密码错误统一返回 401（不泄露账号是否存在）
+    if user is None or user.password_hash is None or not pwd_context.verify(
+        req.password, user.password_hash
+    ):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    expire = datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRE_DAYS)
+    token = jwt.encode(
+        {"sub": user.username, "exp": expire},
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": TOKEN_EXPIRE_DAYS * 24 * 3600,
+        "user": {"id": user.id, "username": user.username, "role": user.role},
+    }
+
+
+@app.get("/api/auth/me")
+def read_me(user: User = Depends(get_current_user)):
+    """获取当前登录用户的完整资料（从数据库查询）。"""
+    return {"user": user_profile(user)}
+
+
+@app.put("/api/auth/me")
+def update_me(
+    req: ProfileUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """更新当前登录用户的资料：只更新前端传入的字段，写回数据库。"""
+    updated = req.model_dump(exclude_unset=True)
+    for field, value in updated.items():
+        # tags 是数组 → 入库前序列化为 JSON 字符串
+        if field == "tags" and value is not None:
+            setattr(user, "tags", json.dumps(value, ensure_ascii=False))
+        else:
+            setattr(user, field, value)
+    db.commit()
+    db.refresh(user)
+    return {"message": "资料已保存", "user": user_profile(user)}
+
+
+# ===== 帖子：发帖 / 列表 / 删除 =====
+@app.post("/api/posts")
+def create_post(
+    req: CreatePostRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """发帖：从 Token 解析当前用户作为作者，写入 posts 表。"""
+    content = (req.content or "").strip()
+    if not content and not req.image_url:
+        raise HTTPException(status_code=400, detail="文字内容和图片至少要有一样")
+
+    post = Post(content=content or None, image_url=req.image_url, author_id=user.id)
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return {"message": "发布成功", "post": post_to_dict(post)}
+
+
+@app.get("/api/posts")
+def list_posts(db: Session = Depends(get_db)):
+    """帖子列表：按创建时间倒序，relationship 带出作者用户名。"""
+    posts = db.query(Post).order_by(Post.created_at.desc(), Post.id.desc()).all()
+    return [post_to_dict(p) for p in posts]
+
+
+@app.delete("/api/posts/{post_id}")
+def delete_post(
+    post_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """删除自己的帖子：只允许作者本人删除。"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if post is None:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+    if post.author_id != user.id:
+        raise HTTPException(status_code=403, detail="只能删除自己的动态")
+    db.delete(post)
+    db.commit()
+    return {"message": "删除成功"}
+
+
+# ===== 帖子互动：点赞 / 评论（产生真实互动通知） =====
+@app.post("/api/posts/{post_id}/like")
+def like_post(
+    post_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """点赞动态：计数 +1 并给作者产生 like 通知；不能赞自己、不能重复赞。"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if post is None:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+    if post.author_id == user.id:
+        raise HTTPException(status_code=400, detail="不能给自己的动态点赞")
+    # 防重复：同一用户对同一帖子只允许一条 like 通知
+    dup = (
+        db.query(Notification)
+        .filter(
+            Notification.type == "like",
+            Notification.actor_id == user.id,
+            Notification.post_id == post_id,
+        )
+        .first()
+    )
+    if dup is not None:
+        raise HTTPException(status_code=400, detail="已经赞过这条动态了")
+    post.likes += 1
+    db.add(
+        Notification(
+            type="like", actor_id=user.id, recipient_id=post.author_id, post_id=post_id
+        )
+    )
+    db.commit()
+    return {"message": "点赞成功", "likes": post.likes}
+
+
+class PostCommentRequest(BaseModel):
+    """帖子评论请求：内容必填。"""
+    content: str
+
+
+@app.post("/api/posts/{post_id}/comments")
+def comment_post(
+    post_id: int,
+    req: PostCommentRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """评论动态：给作者产生 comment 通知（评论内容随通知存储）。"""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if post is None:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+    content = (req.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="评论内容不能为空")
+    if len(content) > 500:
+        raise HTTPException(status_code=400, detail="评论内容不能超过 500 字")
+    notification = Notification(
+        type="comment",
+        actor_id=user.id,
+        recipient_id=post.author_id,
+        post_id=post_id,
+        content=content,
+    )
+    db.add(notification)
+    db.commit()
+    db.refresh(notification)
+    return {"message": "评论成功", "notification": notification_to_dict(notification)}
+
+
+@app.get("/api/notifications")
+def list_notifications(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """通知中心数据源：『当前用户的私人通知』+『全站官方公告』合并后返回。
+
+    - 私人通知（like/comment/review）：**必须** recipient_id == 当前 Token 用户 id，
+      绝不泄露别人的点赞/评论/审核结果
+    - 官方公告（official）：**不加 recipient 过滤**，全站公开，所有登录用户都能看到
+    - 合并后按真实时间 created_at 倒序（source 字段区分来源，供前端删除时选对接口）
+    """
+    # A. 私人通知：严格按收件人过滤
+    rows = (
+        db.query(Notification)
+        .filter(Notification.recipient_id == user.id)
+        .order_by(Notification.id.desc())
+        .all()
+    )
+    items = [
+        {
+            **notification_to_dict(n),
+            "source": "notification",
+            "title": None,
+        }
+        for n in rows
+    ]
+
+    # B. 官方公告：全站公开，所有人可见（不加任何用户过滤）
+    anns = db.query(Announcement).order_by(Announcement.id.desc()).all()
+    items.extend(
+        {
+            "source": "announcement",
+            "id": a.id,
+            "type": "official",
+            "title": a.title,
+            "content": a.content,
+            "post_id": None,
+            "actor_id": 0,
+            "actor_username": "AoliComic官方",
+            "actor_avatar": None,
+            "recipient_id": None,
+            "is_read": True,
+            "created_at": a.created_at.replace(tzinfo=timezone.utc).isoformat(),
+        }
+        for a in anns
+    )
+
+    # 合并后按真实时间倒序（最新在前）
+    items.sort(key=lambda it: it["created_at"], reverse=True)
+    return items
+
+
+@app.get("/api/notifications/unread-count")
+def unread_notification_count(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """未读通知数：导航栏铃铛红点用。"""
+    count = (
+        db.query(Notification)
+        .filter(Notification.recipient_id == user.id, Notification.is_read.is_(False))
+        .count()
+    )
+    return {"count": count}
+
+
+@app.post("/api/notifications/read")
+def mark_notifications_read(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """把我的全部通知标记为已读（进入通知中心时调用，红点消失）。"""
+    updated = (
+        db.query(Notification)
+        .filter(Notification.recipient_id == user.id, Notification.is_read.is_(False))
+        .update({"is_read": True}, synchronize_session=False)
+    )
+    db.commit()
+    return {"message": "已全部标记为已读", "updated": updated}
+
+
+@app.delete("/api/notifications/{notification_id}")
+def delete_notification(
+    notification_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """删除一条**私人**通知。
+
+    权限：管理员可删除任意通知；普通用户**只能删除发给自己的那条**
+    （严格校验 recipient_id == 当前用户 id，否则 403，绝不越权）。
+    公告请走 DELETE /api/announcements/{id}（删除即全站撤销）。
+    """
+    notification = (
+        db.query(Notification).filter(Notification.id == notification_id).first()
+    )
+    if notification is None:
+        raise HTTPException(status_code=404, detail="通知不存在")
+    if user.role != "admin" and notification.recipient_id != user.id:
+        raise HTTPException(status_code=403, detail="无权限：只能删除发给自己的通知")
+    db.delete(notification)
+    db.commit()
+    return {"message": "通知已删除", "id": notification_id}

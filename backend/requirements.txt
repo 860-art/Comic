@@ -1,0 +1,8 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+sqlalchemy>=2.0.30
+# 密码哈希（bcrypt 方案）；bcrypt 钉在 4.0.1 以兼容 passlib 1.7.4
+passlib[bcrypt]>=1.7.4
+bcrypt==4.0.1
+# JWT Token 生成与校验
+python-jose[cryptography]>=3.3.0
