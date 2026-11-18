@@ -223,6 +223,21 @@ class Collection(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+# ===== 翻译结果缓存表：同一张图（按内容 SHA256 唯一）不重复跑 OCR + 大模型 =====
+class TranslationCache(Base):
+    __tablename__ = "translation_cache"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # 图片内容 SHA256 哈希（唯一索引）：data:URL / HTTP URL / 上传文件统一按字节哈希，
+    # 相同图片无论 URL 形式如何都命中同一条缓存
+    image_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    # 原始图片标识（data:URL 过长时截断存储，仅作人工排查参考，不参与查询）
+    image_url: Mapped[str] = mapped_column(String(2048), default="")
+    # 翻译接口的完整返回 JSON（[{box, bg_color, original, translated}, ...]）
+    result_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 # 轻量迁移：旧版 users 表缺列时启动自动补列（这样已有的 app.db 不需要删除重建）
 _inspector = inspect(engine)
 if _inspector.has_table("users"):

@@ -10,6 +10,7 @@
 """
 
 import base64
+import hashlib
 import json
 import os
 import threading
@@ -364,6 +365,53 @@ def _llm_translate(texts: list[str], user_api_key: str = "") -> Optional[list[st
     return None
 
 
+# ===== 翻译结果缓存（TranslationCache 表，模型定义在 main.py） =====
+# 同一张图（按内容 SHA256 唯一）不重复跑 OCR + 大模型，节省时间与 API 额度。
+# 注意：函数内延迟 import main，避免模块加载期的循环导入。
+
+
+def _cache_get(image_hash: str) -> Optional[str]:
+    """查缓存：命中返回 result_json 字符串，未命中返回 None。"""
+    try:
+        from main import SessionLocal, TranslationCache
+
+        db = SessionLocal()
+        try:
+            row = db.query(TranslationCache).filter(TranslationCache.image_hash == image_hash).first()
+            return row.result_json if row else None
+        finally:
+            db.close()
+    except Exception as exc:
+        # 缓存层任何异常都不影响翻译主流程（视为未命中）
+        print(f"[translate] 缓存查询失败（按未命中处理）: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _cache_put(image_hash: str, image_url: str, result: list[dict]) -> None:
+    """写入缓存（已存在同 hash 时跳过；写失败不影响主流程）。"""
+    try:
+        from main import SessionLocal, TranslationCache
+
+        db = SessionLocal()
+        try:
+            exists = db.query(TranslationCache).filter(TranslationCache.image_hash == image_hash).first()
+            if exists:
+                return
+            db.add(
+                TranslationCache(
+                    image_hash=image_hash,
+                    # data:URL 动辄几 MB，只截断存前 2000 字符供人工排查
+                    image_url=(image_url or "")[:2000],
+                    result_json=json.dumps(result, ensure_ascii=False),
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[translate] 缓存写入失败（不影响翻译结果）: {type(exc).__name__}: {exc}")
+
+
 # ===== 接口：POST /api/translate =====
 
 
@@ -407,11 +455,20 @@ async def translate_comic(request: Request):
         raise HTTPException(status_code=400, detail=f"不支持的语言，可选：{sorted(set(SUPPORTED_LANGS.values()))}")
 
     if file_bytes:
-        img = _decode_image(file_bytes)
+        img_bytes = file_bytes
     elif image_url:
-        img = _decode_image(_fetch_image_bytes(str(image_url)))
+        img_bytes = _fetch_image_bytes(str(image_url))
     else:
         raise HTTPException(status_code=400, detail="缺少图片：请提供 image_url 或 file")
+    img = _decode_image(img_bytes)
+
+    # 翻译结果缓存：按图片内容 SHA256 唯一标识（同图不同 URL 形式/不同 Key 都命中同一条）
+    cache_key = hashlib.sha256(img_bytes).hexdigest()
+    cached_json = _cache_get(cache_key)
+    if cached_json is not None:
+        print(f"[缓存命中] hash={cache_key[:16]}… 跳过 OCR 与大模型调用，直接返回缓存结果")
+        return json.loads(cached_json)
+    print(f"[新图翻译并写入缓存] hash={cache_key[:16]}… 未命中，开始 OCR + 翻译")
 
     # OCR（模型未就绪/下载失败 → 503，提示如何手动放置模型）
     try:
@@ -434,12 +491,16 @@ async def translate_comic(request: Request):
         print(f"[translate]   {it['text']!r} box={it['box']}")
     if not items:
         print("[translate] OCR 未识别到任何文本（返回空数组）")
+        _cache_put(cache_key, str(image_url or ""), [])
+        print("[新图翻译并写入缓存] 空结果也写入缓存")
         return []
 
     # 过滤超大拟声词框与无效短文本（不翻译、不取色、不返回）
     items = _filter_items(items, img)
     if not items:
         print("[translate] 过滤后无剩余文本框（全部被尺寸/无效字符过滤）")
+        _cache_put(cache_key, str(image_url or ""), [])
+        print("[新图翻译并写入缓存] 空结果也写入缓存")
         return []
 
     # 同气泡多行小框合并成大气泡框：整段话一次性发给 LLM，翻译出连贯中文
@@ -452,7 +513,7 @@ async def translate_comic(request: Request):
         # 未配置 Key 或调用失败 → 伪翻译，保证流程可先跑通
         translated = [f"[译] {t}" for t in texts]
 
-    return [
+    result = [
         {
             "box": it["box"],
             "bg_color": _bubble_bg_color(img, it["box"]),
@@ -461,3 +522,7 @@ async def translate_comic(request: Request):
         }
         for i, it in enumerate(items)
     ]
+    # 新图翻译完成：结果写入缓存，下次同图直接命中
+    _cache_put(cache_key, str(image_url or ""), result)
+    print(f"[新图翻译并写入缓存] hash={cache_key[:16]}… 共 {len(result)} 条气泡")
+    return result
