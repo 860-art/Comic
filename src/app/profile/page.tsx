@@ -87,7 +87,7 @@ export default function ProfilePage() {
     signature: "今天也在追更漫画。",
     gender: "女",
     birthday: "8-8",
-    tags: [], // 默认没有标签，由用户自行添加管理
+    tags: [] as string[], // 默认没有标签，由用户自行添加管理
     fans: 0, // 真实数据：默认没有粉丝
     likes: 0, // 真实数据：默认没有获赞
   });

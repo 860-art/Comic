@@ -268,6 +268,7 @@ function FeedView({
           id: `c-${n.id}`,
           author: n.actor_username,
           avatar: n.actor_avatar ?? undefined,
+          color: "bg-violet-200",
           time: "刚刚",
           content: text,
           likes: 0,

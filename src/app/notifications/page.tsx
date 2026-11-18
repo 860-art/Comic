@@ -260,7 +260,9 @@ export default function NotificationsPage() {
       setItems((prev) => [
         {
           kind: "official",
+          source: "announcement",
           id: `ann-${a.id}`,
+          numericId: a.id,
           content: a.content,
           createdAt: a.created_at,
         },

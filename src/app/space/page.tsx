@@ -538,7 +538,7 @@ export default function SpacePage() {
                 <p className="text-xs text-zinc-400">自定义标签</p>
                 <div className="mt-2 flex flex-wrap gap-2">
                   {customTags
-                    .filter((t) => !ALL_TAGS.includes(t))
+                    .filter((t) => !(ALL_TAGS as readonly string[]).includes(t))
                     .map((tag) => (
                       <button
                         key={tag}
