@@ -13,6 +13,7 @@ AoliComic 后端服务入口（FastAPI + SQLAlchemy + SQLite）。
 """
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -35,17 +36,24 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
-# ===== 数据库配置：SQLite 文件位于 backend/app.db =====
+# ===== 数据库配置（Railway 部署友好） =====
+# - 本地：SQLite 文件位于 backend/app.db
+# - Railway：给服务挂 Volume 并设 DATA_DIR=/data（持久化目录），数据库落在这里；
+#   或者直接设 DATABASE_URL 指向 Postgres/MySQL 连接串（需另装驱动）
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_URL = f"sqlite:///{BASE_DIR / 'app.db'}"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)  # Volume 挂载点不存在时自动创建
+DATABASE_URL = os.getenv("DATABASE_URL") or f"sqlite:///{DATA_DIR / 'app.db'}"
 
-# SQLite 需要关闭同线程检查（uvicorn 的线程池访问）
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# SQLite 需要关闭同线程检查（uvicorn 的线程池访问）；其它数据库无需该项
+_engine_kwargs = {"connect_args": {"check_same_thread": False}} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 # ===== 认证配置 =====
-# JWT 签名密钥：开发用随机值；生产环境务必换成环境变量并保密
-SECRET_KEY = "aolicom-dev-secret-change-me-in-production"
+# JWT 签名密钥：Railway Variables 里必须设置 SECRET_KEY（随机长字符串）；
+# 缺省值仅用于本地开发，生产环境不设置会导致 Token 可被伪造
+SECRET_KEY = os.getenv("SECRET_KEY", "aolicom-dev-secret-change-me-in-production")
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7  # Token 有效期：7 天
 
