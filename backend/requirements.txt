@@ -6,9 +6,8 @@ python-multipart>=0.0.9
 # 数据库
 sqlalchemy>=2.0.30
 
-# 密码哈希（bcrypt 方案）；bcrypt 钉在 4.0.1 以兼容 passlib 1.7.4
-passlib[bcrypt]>=1.7.4
-bcrypt==4.0.1
+# 密码哈希：原生 bcrypt（弃用 passlib，规避其兼容层 72 字节误报 bug）
+bcrypt>=4.1.0
 
 # JWT Token 生成与校验
 python-jose[cryptography]>=3.3.0

@@ -20,7 +20,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
 from pydantic import BaseModel
 from sqlalchemy import (
     Boolean,
@@ -57,8 +57,19 @@ SECRET_KEY = os.getenv("SECRET_KEY", "aolicom-dev-secret-change-me-in-production
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7  # Token 有效期：7 天
 
-# 密码哈希上下文：bcrypt
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# 密码哈希：直接使用原生 bcrypt（passlib 1.7.4 与新版 bcrypt 的兼容层存在
+# "password cannot be longer than 72 bytes" 误报 bug，绕过它彻底规避）
+def hash_password(plain: str) -> str:
+    """bcrypt 哈希，绝不存明文。"""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """校验密码（兼容 passlib 时代生成的 $2b$ 哈希）。"""
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except ValueError:
+        return False
 
 
 # ===== ORM 基类 =====
@@ -138,7 +149,7 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
+    email: str
     password: str
 
 
@@ -1237,6 +1248,9 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
     # 基础校验
     if not username or not email or not req.password:
         raise HTTPException(status_code=400, detail="用户名、邮箱和密码均不能为空")
+    # 邮箱格式校验：必须包含 @（简单校验，配合前端提示）
+    if "@" not in email or email.startswith("@") or email.endswith("@"):
+        raise HTTPException(status_code=400, detail="邮件格式不正确")
     if len(req.password) < 6:
         raise HTTPException(status_code=400, detail="密码长度至少 6 位")
 
@@ -1253,7 +1267,7 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
     user = User(
         username=username,
         email=email,
-        password_hash=pwd_context.hash(req.password),  # bcrypt 哈希，绝不存明文
+        password_hash=hash_password(req.password),  # bcrypt 哈希，绝不存明文
     )
     db.add(user)
     db.commit()
@@ -1264,13 +1278,13 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/auth/login")
 def login(req: LoginRequest, db: Session = Depends(get_db)):
-    """登录：校验密码 → 生成 7 天有效期的 JWT Token 返回给前端。"""
-    user = db.query(User).filter(User.username == req.username.strip()).first()
+    """登录：邮箱 + 密码 → 校验密码 → 生成 7 天有效期的 JWT Token 返回给前端。"""
+    user = db.query(User).filter(User.email == req.email.strip().lower()).first()
     # 用户不存在或密码错误统一返回 401（不泄露账号是否存在）
-    if user is None or user.password_hash is None or not pwd_context.verify(
+    if user is None or user.password_hash is None or not verify_password(
         req.password, user.password_hash
     ):
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
+        raise HTTPException(status_code=401, detail="邮箱或密码错误")
 
     expire = datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRE_DAYS)
     token = jwt.encode(

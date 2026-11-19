@@ -102,17 +102,19 @@ export default function Navbar() {
             </div>
           )}
 
-          {/* 通知铃铛：固定最右侧，点击进通知中心；有未读显示红点 */}
-          <Link
-            href={ROUTES.notifications}
-            aria-label={unread > 0 ? `通知（${unread} 条未读）` : "通知"}
-            className="relative flex h-8 w-8 items-center justify-center rounded-full text-zinc-600 transition-colors hover:bg-zinc-100 hover:text-zinc-900"
-          >
-            <Bell className="h-4 w-4" />
-            {unread > 0 && (
-              <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-red-500 ring-2 ring-white" />
-            )}
-          </Link>
+          {/* 通知铃铛：仅登录后显示，固定最右侧，点击进通知中心；有未读显示红点 */}
+          {auth.isLoggedIn && (
+            <Link
+              href={ROUTES.notifications}
+              aria-label={unread > 0 ? `通知（${unread} 条未读）` : "通知"}
+              className="relative flex h-8 w-8 items-center justify-center rounded-full text-zinc-600 transition-colors hover:bg-zinc-100 hover:text-zinc-900"
+            >
+              <Bell className="h-4 w-4" />
+              {unread > 0 && (
+                <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-red-500 ring-2 ring-white" />
+              )}
+            </Link>
+          )}
         </div>
       </div>
     </header>

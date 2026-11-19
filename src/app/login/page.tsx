@@ -10,7 +10,8 @@ import { API_BASE } from "@/lib/api";
 
 export default function LoginPage() {
   const router = useRouter();
-  const [username, setUsername] = useState("");
+  // 登录方式：邮箱 + 密码（后端按 email 查询用户）
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -18,19 +19,19 @@ export default function LoginPage() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!username.trim() || !password.trim()) {
-      setError("请填写用户名和密码");
+    if (!email.trim() || !password.trim()) {
+      setError("请填写邮箱和密码");
       return;
     }
     setError("");
     setLoading(true);
     try {
-      // 真实登录：请求后端 /api/auth/login
+      // 真实登录：请求后端 /api/auth/login（邮箱 + 密码）
       const res = await fetch(`${API_BASE}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          username: username.trim(),
+          email: email.trim(),
           password: password,
         }),
       });
@@ -43,7 +44,7 @@ export default function LoginPage() {
       }
       const data = await res.json();
       // 关键：保存 JWT token 与用户名，之后所有页面据此判断登录态
-      saveLoginSession(data.user?.username ?? username.trim(), data.access_token);
+      saveLoginSession(data.user?.username ?? email.trim(), data.access_token);
       router.push(ROUTES.home);
     } catch (err) {
       console.error("[登录] 请求失败：", err);
@@ -56,14 +57,14 @@ export default function LoginPage() {
   return (
     <div className="mx-auto max-w-sm px-4 py-16">
       <h1 className="text-2xl font-semibold">登录</h1>
-      <p className="mt-2 text-sm text-zinc-500">请输入您的账号和密码</p>
+      <p className="mt-2 text-sm text-zinc-500">请输入您的邮箱和密码</p>
 
       <form onSubmit={handleSubmit} className="mt-6 space-y-4">
         <input
-          type="text"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          placeholder="用户名"
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="邮箱"
           className="w-full rounded-md border border-zinc-200 px-3 py-2 text-sm outline-none"
         />
         <input
@@ -101,7 +102,7 @@ export default function LoginPage() {
             onClick={(e) => e.stopPropagation()}
           >
             <h2 className="text-xl font-bold text-red-600">错误</h2>
-            <p className="mt-3 text-sm text-zinc-700">用户名或密码错误</p>
+            <p className="mt-3 text-sm text-zinc-700">邮箱或密码错误</p>
             <button
               type="button"
               onClick={() => setShowErrorModal(false)}

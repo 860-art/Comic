@@ -22,6 +22,11 @@ export default function RegisterPage() {
       setError("请填写用户名、邮箱和密码");
       return;
     }
+    // 邮箱格式校验：必须包含 @，否则无法注册
+    if (!email.includes("@") || email.startsWith("@") || email.endsWith("@")) {
+      setError("邮件格式不正确");
+      return;
+    }
     if (password.length < 6) {
       setError("密码长度至少 6 位");
       return;
