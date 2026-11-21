@@ -272,6 +272,13 @@ class TranslationCache(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+# ===== 阶段一：先建表，再执行任何模块级数据库查询 =====
+# 下面 275 行起的轻量迁移、description 回填、AO 管理员初始化都是 import 时
+# 直接执行的代码，会查询 comics / users / pending_comics 等表。
+# Railway PostgreSQL 是全新空库，若等到文件末尾才 create_all 会先报
+# "关系 comics 不存在"（UndefinedTable）。此处先建当前已定义的 7 张表。
+Base.metadata.create_all(bind=engine)
+
 # 轻量迁移：旧版 users 表缺列时启动自动补列（这样已有的 app.db 不需要删除重建）
 _inspector = inspect(engine)
 if _inspector.has_table("users"):
@@ -719,9 +726,11 @@ def notification_to_dict(n: Notification) -> dict:
     }
 
 
-# 首次启动自动建表（生成 app.db）——必须在所有 ORM 模型定义之后调用，
-# 否则后定义的模型（如 comments 表）不会被创建
+# 阶段二：所有 ORM 模型定义完毕后再建一次表——补齐阶段一之后才定义的
+# comments / announcements / notifications 三张表；已存在的表 checkfirst 自动跳过，
+# 重复调用无副作用（PostgreSQL / SQLite 均适用）。
 Base.metadata.create_all(bind=engine)
+print("[init] 数据库建表完成")
 
 # ===== 官方公告 =====
 @app.get("/api/announcements")
