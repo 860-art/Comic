@@ -36,18 +36,23 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
-# ===== 数据库配置（Railway 部署友好） =====
-# - 本地：SQLite 文件位于 backend/app.db
-# - Railway：给服务挂 Volume 并设 DATA_DIR=/data（持久化目录），数据库落在这里；
-#   或者直接设 DATABASE_URL 指向 Postgres/MySQL 连接串（需另装驱动）
+# ===== 数据库配置（Railway PostgreSQL / 本地 SQLite 双兼容） =====
+# - Railway：环境变量 DATABASE_URL 注入 PostgreSQL 连接串（postgres://...）
+# - 本地：没有 DATABASE_URL 时默认使用 SQLite（DATA_DIR 目录下的 app.db）
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)  # Volume 挂载点不存在时自动创建
-DATABASE_URL = os.getenv("DATABASE_URL") or f"sqlite:///{DATA_DIR / 'app.db'}"
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL") or f"sqlite:///{DATA_DIR / 'app.db'}"
 
-# SQLite 需要关闭同线程检查（uvicorn 的线程池访问）；其它数据库无需该项
-_engine_kwargs = {"connect_args": {"check_same_thread": False}} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, **_engine_kwargs)
+# 兼容 SQLAlchemy 前缀：旧版连接串用 postgres://，SQLAlchemy 只认 postgresql://
+if SQLALCHEMY_DATABASE_URL.startswith("postgres://"):
+    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# SQLite 需要关闭同线程检查（uvicorn 的线程池访问）；PostgreSQL 等无需该项
+_engine_kwargs = (
+    {"connect_args": {"check_same_thread": False}} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {}
+)
+engine = create_engine(SQLALCHEMY_DATABASE_URL, **_engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 # ===== 认证配置 =====

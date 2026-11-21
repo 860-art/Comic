@@ -5,6 +5,8 @@ python-multipart>=0.0.9
 
 # 数据库
 sqlalchemy>=2.0.30
+# PostgreSQL 驱动（Railway DATABASE_URL 使用）
+psycopg2-binary>=2.9.9
 
 # 密码哈希：原生 bcrypt（弃用 passlib，规避其兼容层 72 字节误报 bug）
 bcrypt>=4.1.0
