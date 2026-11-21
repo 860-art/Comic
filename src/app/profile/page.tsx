@@ -6,6 +6,7 @@ import { Camera, ChevronRight, Pencil, Star, Upload, X } from "lucide-react";
 import { getAuth, getToken, mockLogout } from "@/lib/auth";
 import { API_BASE } from "@/lib/api";
 import { ROUTES } from "@/lib/navigation";
+import { uploadImage } from "@/lib/upload";
 
 /**
  * 个人中心页（白色玻璃态 · 名片式布局，参考 QQ 资料卡）：
@@ -259,8 +260,8 @@ export default function ProfilePage() {
     setEditOpen(true);
   };
 
-  // 上传图片：FileReader 转 dataURL → 更新本地预览 + PUT /api/auth/me 存入数据库
-  const uploadImage = async (
+  // 上传图片：先传 R2 拿公网 URL → 更新本地预览 + PUT /api/auth/me 存入数据库
+  const uploadProfileImage = async (
     e: React.ChangeEvent<HTMLInputElement>,
     field: "avatar_url" | "cover_url",
     setter: (src: string) => void
@@ -268,13 +269,14 @@ export default function ProfilePage() {
     const file = e.target.files?.[0];
     e.target.value = ""; // 允许重复选择同一文件
     if (!file) return;
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(file);
-    });
-    setter(dataUrl);
+    let url: string;
+    try {
+      url = await uploadImage(file);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "图片上传失败");
+      return;
+    }
+    setter(url);
     const token = getToken();
     if (!token) return;
     try {
@@ -284,7 +286,7 @@ export default function ProfilePage() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ [field]: dataUrl }),
+        body: JSON.stringify({ [field]: url }),
       });
       showToast(res.ok ? "图片已保存" : "保存失败，请重新登录后重试");
     } catch (err) {
@@ -661,14 +663,14 @@ export default function ProfilePage() {
         type="file"
         accept="image/*"
         className="hidden"
-        onChange={(e) => uploadImage(e, "cover_url", setBannerSrc)}
+        onChange={(e) => uploadProfileImage(e, "cover_url", setBannerSrc)}
       />
       <input
         ref={avatarInputRef}
         type="file"
         accept="image/*"
         className="hidden"
-        onChange={(e) => uploadImage(e, "avatar_url", setAvatarSrc)}
+        onChange={(e) => uploadProfileImage(e, "avatar_url", setAvatarSrc)}
       />
 
       {/* ===== 模块一底部菜单：三项 ===== */}

@@ -19,21 +19,12 @@ import { getToken } from "@/lib/auth";
  */
 
 import { API_BASE } from "@/lib/api";
+import { uploadImage } from "@/lib/upload";
 
 /** 单个章节的表单数据 */
 interface ChapterForm {
   title: string;
   images: string[];
-}
-
-/** 读取图片文件为 dataURL（可直接持久化进 localStorage） */
-function readAsDataURL(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
 }
 
 /** 投稿表单主体：使用 useSearchParams，必须在 Suspense 内渲染（见底部默认导出） */
@@ -99,11 +90,16 @@ function UploadForm() {
     setTimeout(() => setToastMsg(null), 2200);
   };
 
-  // 封面选择：只取第一张替换
+  // 封面选择：只取第一张替换（上传到 R2 对象存储，返回公网 URL）
   const handleCover = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) setCover(await readAsDataURL(file));
     e.target.value = "";
+    if (!file) return;
+    try {
+      setCover(await uploadImage(file));
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "封面上传失败");
+    }
   };
 
   // ===== 动态章节管理 =====
@@ -134,17 +130,21 @@ function UploadForm() {
     pagesInputRef.current?.click();
   };
 
-  // 某章节内页多选：dataURL 累积到对应章节
+  // 某章节内页多选：逐张上传到 R2，公网 URL 累积到对应章节
   const handlePages = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const index = activeChapterRef.current;
     const files = Array.from(e.target.files ?? []);
-    if (files.length > 0) {
-      const urls = await Promise.all(files.map(readAsDataURL));
-      setChapters((prev) =>
-        prev.map((c, i) => (i === index ? { ...c, images: [...c.images, ...urls] } : c))
-      );
-    }
     e.target.value = "";
+    if (files.length > 0) {
+      try {
+        const urls = await Promise.all(files.map(uploadImage));
+        setChapters((prev) =>
+          prev.map((c, i) => (i === index ? { ...c, images: [...c.images, ...urls] } : c))
+        );
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : "内页上传失败");
+      }
+    }
   };
 
   // 移除某章节的单张内页

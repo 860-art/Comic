@@ -14,10 +14,11 @@ AoliComic 后端服务入口（FastAPI + SQLAlchemy + SQLite）。
 
 import json
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
 import bcrypt
@@ -1357,6 +1358,105 @@ def update_me(
     db.commit()
     db.refresh(user)
     return {"message": "资料已保存", "user": user_profile(user)}
+
+
+# ===== Cloudflare R2 对象存储：图片上传（S3 兼容协议，boto3） =====
+# 密钥全部来自环境变量，Railway Variables 里配置：
+#   R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET_NAME
+#   R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com
+#   R2_PUBLIC_BASE=https://pub-xxx.r2.dev（或绑定的自定义域，须开启公开访问）
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "")
+R2_ENDPOINT = os.getenv("R2_ENDPOINT", "")
+R2_PUBLIC_BASE = os.getenv("R2_PUBLIC_BASE", "").rstrip("/")
+
+# 允许的图片类型 → 文件扩展名
+_UPLOAD_ALLOWED = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+# 单张图片上限 10MB（防止占满 R2 与拖慢请求）
+_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+_r2_client = None
+
+
+def _get_r2_client():
+    """懒加载 boto3 S3 客户端（R2 兼容 S3 协议，region 固定 auto）。"""
+    global _r2_client
+    if _r2_client is None:
+        import boto3
+
+        _r2_client = boto3.client(
+            "s3",
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+        )
+    return _r2_client
+
+
+@app.post("/api/upload")
+async def upload_image(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    """上传图片到 Cloudflare R2（不落服务器本地盘，不存 data:URL）。
+
+    - 需登录（防止匿名滥用刷流量）
+    - 返回 {"url": 公网链接}；前端把这个 URL 作为 cover_url / image_url 等存库
+    """
+    missing = [
+        name
+        for name, val in [
+            ("R2_ACCESS_KEY_ID", R2_ACCESS_KEY_ID),
+            ("R2_SECRET_ACCESS_KEY", R2_SECRET_ACCESS_KEY),
+            ("R2_BUCKET_NAME", R2_BUCKET_NAME),
+            ("R2_ENDPOINT", R2_ENDPOINT),
+            ("R2_PUBLIC_BASE", R2_PUBLIC_BASE),
+        ]
+        if not val
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail=f"对象存储未配置，缺少环境变量: {', '.join(missing)}",
+        )
+
+    ext = _UPLOAD_ALLOWED.get((file.content_type or "").lower())
+    if ext is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的图片类型: {file.content_type}（仅支持 JPG/PNG/WebP/GIF）",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="空文件")
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="图片超过 10MB 上限")
+
+    # 对象键：uploads/年/月/uuid.ext —— 天然去重、按月归档、不可预测
+    key = f"uploads/{datetime.utcnow():%Y/%m}/{uuid.uuid4().hex}.{ext}"
+    try:
+        _get_r2_client().put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=key,
+            Body=data,
+            ContentType=file.content_type,
+        )
+    except Exception as exc:
+        print(f"[upload] R2 上传失败: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=502, detail="图片上传到对象存储失败，请稍后重试")
+
+    # R2 put_object 不返回公网地址，公网 URL = 公开访问域 + 对象键
+    url = f"{R2_PUBLIC_BASE}/{key}"
+    print(f"[upload] {user.username} 上传成功 {key}（{len(data)} bytes）")
+    return {"url": url}
 
 
 # ===== 帖子：发帖 / 列表 / 删除 =====

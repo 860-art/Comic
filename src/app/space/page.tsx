@@ -29,6 +29,7 @@ import { ME_DEFAULT_AVATAR, ME_DEFAULT_BANNER, ME_DEFAULT_NAME } from "@/data/po
  */
 
 import { API_BASE } from "@/lib/api";
+import { uploadImage } from "@/lib/upload";
 
 /** 后端 GET /api/posts 返回的单条数据结构 */
 interface ApiPost {
@@ -131,14 +132,16 @@ export default function SpacePage() {
     else if (!loggedIn) setLoading(false);
   }, [myId, loggedIn, loadPosts]);
 
-  // 本地选图：FileReader 转 dataURL（可直接作为 image_url 提交入库）
-  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // 本地选图：上传到 R2 对象存储，公网 URL 作为 image_url 提交入库
+  const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => setImages([reader.result as string]);
-    reader.readAsDataURL(file);
+    try {
+      setImages([await uploadImage(file)]);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "图片上传失败");
+    }
   };
 
   // 标签选择（仅展示用）
