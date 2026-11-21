@@ -44,9 +44,19 @@ DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)  # Volume 挂载点不存在时自动创建
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL") or f"sqlite:///{DATA_DIR / 'app.db'}"
 
-# 兼容 SQLAlchemy 前缀：旧版连接串用 postgres://，SQLAlchemy 只认 postgresql://
-if SQLALCHEMY_DATABASE_URL.startswith("postgres://"):
-    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# 兼容并统一 PostgreSQL 前缀：
+# - Railway 注入的旧式 postgres:// → SQLAlchemy 只认 postgresql://
+# - 显式指定 +psycopg2 驱动，避免 SQLAlchemy 默认方言解析到 psycopg(3) 而报
+#   "No module named 'psycopg'"（psycopg2-binary 才是 requirements 里装的驱动）
+_PG_PREFIXES = {
+    "postgres://": "postgresql+psycopg2://",
+    "postgresql://": "postgresql+psycopg2://",
+    "postgresql+psycopg://": "postgresql+psycopg2://",
+}
+for _prefix, _replacement in _PG_PREFIXES.items():
+    if SQLALCHEMY_DATABASE_URL.startswith(_prefix):
+        SQLALCHEMY_DATABASE_URL = _replacement + SQLALCHEMY_DATABASE_URL[len(_prefix):]
+        break
 
 # SQLite 需要关闭同线程检查（uvicorn 的线程池访问）；PostgreSQL 等无需该项
 _engine_kwargs = (
