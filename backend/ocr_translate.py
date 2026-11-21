@@ -1,11 +1,17 @@
 """OCR 漫画翻译服务（真实接口）。
 
-流程：图片 → PaddleOCR 识别文字与坐标框 → OpenCV 取气泡边缘平均背景色 →
+流程：图片 → PaddleOCR Mobile 识别文字与坐标框 → OpenCV 取气泡边缘平均背景色 →
 调用智谱 GLM / DeepSeek 翻译成中文（未配置 API Key 时返回伪翻译 "[译] 原文"）。
+主引擎识别结果为空或置信度偏低时，自动降级到百度 OCR 备用引擎。
 
 环境变量：
-- ZHIPU_API_KEY    智谱开放平台 Key（免费模型 glm-4-flash）
-- DEEPSEEK_API_KEY DeepSeek Key（deepseek-chat）
+- ZHIPU_API_KEY           智谱开放平台 Key（免费模型 glm-4-flash）
+- DEEPSEEK_API_KEY        DeepSeek Key（deepseek-chat）
+- BAIDU_OCR_API_KEY       百度智能云 OCR 应用 API Key（备用引擎；不配 = 备用禁用）
+- BAIDU_OCR_SECRET_KEY    百度智能云 OCR Secret Key（日志永不输出完整值）
+- OCR_MAX_CONCURRENCY     OCR 推理并发上限（默认 1；2核4G 建议 1，防内存溢出）
+- BAIDU_TRIGGER_CONFIDENCE 主引擎平均置信度低于该值触发备用引擎（默认 0.65）
+- OCR_WARMUP              启动时预热 OCR 模型（默认 1；设 0 关闭）
 两者都没配置 → 伪翻译，方便先联调前端。
 """
 
@@ -14,6 +20,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from typing import Optional
 
 import cv2
@@ -27,6 +34,13 @@ router = APIRouter()
 # 支持的 OCR 语言（PaddleOCR 的 lang 参数值）
 SUPPORTED_LANGS = {"ch": "ch", "en": "en", "korean": "korean", "ko": "korean", "japan": "japan"}
 
+# ===== 服务器资源保护：OCR 推理并发限制 =====
+# PaddleOCR 并发推理时每个请求内存峰值叠加，2核4G 上容易 OOM。
+# 信号量把推理串行化：超出的请求排队等待（最多等 90 秒后返回 503）。
+OCR_MAX_CONCURRENCY = max(1, int(os.getenv("OCR_MAX_CONCURRENCY", "1") or "1"))
+_ocr_semaphore = threading.BoundedSemaphore(OCR_MAX_CONCURRENCY)
+_OCR_QUEUE_TIMEOUT = 90  # 排队等待上限（秒）
+
 # ===== 大尺寸文本框过滤阈值（可按需微调） =====
 # 韩漫/日漫里巨大的拟声词（如 악、ドン）会被 OCR 识别成一个超大框，
 # 覆盖大半个画面，翻译框会严重遮挡画面 → 按占图比例直接跳过。
@@ -35,27 +49,69 @@ MAX_BOX_WIDTH_RATIO = 0.60   # 文字框宽度超过图片总宽度的 60% → �
 MAX_BOX_HEIGHT_RATIO = 0.40  # 文字框高度超过图片总高度的 40% → 跳过
 MIN_MEANINGFUL_CHARS = 2     # 有效字符（去掉标点/空白后的字母数字）少于 2 个 → 跳过（单字符拟声词/标点）
 
-# ===== OCR 懒加载单例（按语言缓存；首次调用会自动下载模型到用户目录） =====
+# ===== OCR 懒加载单例（按语言缓存；启动预热 + 首次调用兜底） =====
+# PaddleOCR 3.x 默认加载 PP-OCRv5 **Server** 模型（det ~85MB / rec ~90MB），
+# 2核4G 服务器内存吃紧且推理慢 → 中/英/日显式切换 Mobile 轻量模型（det ~5MB / rec ~16MB）。
+# 返回结构与 Server 版完全一致（rec_texts 等 dict），下游解析零改动。
+_MOBILE_DET = "PP-OCRv5_mobile_det"
+_MOBILE_REC = "PP-OCRv5_mobile_rec"
+
 _ocr_instances: dict[str, object] = {}
 _ocr_lock = threading.Lock()
 
 
 def _get_ocr(lang: str):
-    """获取（或初始化）PaddleOCR 实例。模型下载失败会抛异常，由接口转成 503。"""
+    """获取（或初始化）PaddleOCR 实例（Mobile 轻量模型）。模型下载失败会抛异常，由接口转成 503。
+
+    模型选择策略：
+    - 检测模型与语言无关（只找文字位置）→ 全语言统一用 PP-OCRv5_mobile_det
+    - 识别模型必须匹配语言字典：中/英/日用 PP-OCRv5_mobile_rec；
+      韩文 PP-OCRv5 不支持 → 不显式指定，落到默认 korean_PP-OCRv4_mobile_rec（本身就是轻量版）
+    - 显式指定失败时回退默认配置（绝不因模型选择问题破坏原有识别功能）
+    """
     with _ocr_lock:
         if lang not in _ocr_instances:
             from paddleocr import PaddleOCR  # 延迟导入：未安装 paddle 时其它接口不受影响
 
             # enable_mkldnn=False：paddle 3.3.1 的 onednn 执行器存在
             # ConvertPirAttribute2RuntimeAttribute 兼容 bug，CPU 推理必须走纯 CPU 算子
-            _ocr_instances[lang] = PaddleOCR(
+            base_kwargs = dict(
                 lang=lang,
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
                 enable_mkldnn=False,
             )
+            try:
+                if lang == "korean":
+                    # 韩文：识别模型用默认（韩文专用轻量模型），检测模型仍换 Mobile
+                    _ocr_instances[lang] = PaddleOCR(
+                        text_detection_model_name=_MOBILE_DET, **base_kwargs
+                    )
+                else:
+                    _ocr_instances[lang] = PaddleOCR(
+                        text_detection_model_name=_MOBILE_DET,
+                        text_recognition_model_name=_MOBILE_REC,
+                        **base_kwargs,
+                    )
+            except Exception as exc:
+                # 兜底：显式 Mobile 模型在当前环境不可用时回退默认（保证功能不中断）
+                print(f"[ocr] Mobile 模型初始化失败，回退默认模型: {type(exc).__name__}: {exc}")
+                _ocr_instances[lang] = PaddleOCR(**base_kwargs)
         return _ocr_instances[lang]
+
+
+def warmup_ocr(lang: str = "en") -> None:
+    """启动时预热 OCR 模型（后台线程调用，失败不影响服务启动）。
+
+    加载一次模型常驻内存，避免首个用户请求承担 5~30 秒的模型加载/下载等待。
+    """
+    try:
+        started = time.time()
+        _get_ocr(lang)
+        print(f"[warmup] PaddleOCR({lang}) Mobile 模型预热完成（{time.time() - started:.1f}s）")
+    except Exception as exc:
+        print(f"[warmup] OCR 预热失败（不影响启动，首次请求时会重试）: {type(exc).__name__}: {exc}")
 
 
 # ===== 图片加载：支持 multipart 文件 / data:base64 / http(s) URL / 本地路径 =====
@@ -113,6 +169,7 @@ def _result_field(result: dict, key: str) -> list:
 
 
 def _parse_ocr_result(raw) -> list[dict]:
+    """解析 OCR 原始结果 → [{box, text, conf}]。conf（置信度 0~1）用于主引擎质量判断。"""
     items: list[dict] = []
     if raw is None:
         return items
@@ -124,6 +181,7 @@ def _parse_ocr_result(raw) -> list[dict]:
         texts = _result_field(first, "rec_texts")
         polys = _result_field(first, "rec_polys")
         boxes = _result_field(first, "rec_boxes")
+        scores = _result_field(first, "rec_scores")
         for i, text in enumerate(texts):
             xywh = None
             if i < len(polys) and polys[i] is not None:
@@ -133,7 +191,13 @@ def _parse_ocr_result(raw) -> list[dict]:
                 xywh = [b[0], b[1], b[2] - b[0], b[3] - b[1]]
             if xywh is None:
                 continue
-            items.append({"box": xywh, "text": str(text)})
+            conf = None
+            if i < len(scores):
+                try:
+                    conf = float(scores[i])
+                except (TypeError, ValueError):
+                    conf = None
+            items.append({"box": xywh, "text": str(text), "conf": conf})
         return items
 
     # 2.x：[[poly, (text, conf)], ...]
@@ -141,9 +205,14 @@ def _parse_ocr_result(raw) -> list[dict]:
         try:
             poly, pair = entry[0], entry[1]
             text = pair[0]
+            conf = None
+            try:
+                conf = float(pair[1])
+            except (TypeError, ValueError, IndexError):
+                conf = None
             xywh = _poly_to_xywh(poly)
             if xywh is not None:
-                items.append({"box": xywh, "text": str(text)})
+                items.append({"box": xywh, "text": str(text), "conf": conf})
         except Exception:
             continue
     return items
@@ -365,6 +434,151 @@ def _llm_translate(texts: list[str], user_api_key: str = "") -> Optional[list[st
     return None
 
 
+# ===== 百度 OCR 备用引擎（主引擎质量不合格时自动降级） =====
+# 密钥全部来自环境变量（BAIDU_OCR_API_KEY / BAIDU_OCR_SECRET_KEY），绝不硬编码。
+# 未配置 → 备用引擎静默禁用（返回 None），主引擎照常工作。
+# access_token 内存缓存（有效期约 30 天），失效自动重取；任何异常都不影响主流程。
+
+BAIDU_TOKEN_URL = "https://aip.baidubce.com/oauth/2.0/token"
+BAIDU_OCR_URL = "https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic"
+
+# PaddleOCR lang → 百度 language_type 映射
+_BAIDU_LANG_MAP = {"ch": "CHN_ENG", "en": "ENG", "korean": "KOR", "japan": "JAP"}
+
+# 主引擎平均置信度低于该值 → 触发百度备用
+BAIDU_TRIGGER_CONFIDENCE = float(os.getenv("BAIDU_TRIGGER_CONFIDENCE", "0.65") or "0.65")
+
+_baidu_token: Optional[str] = None
+_baidu_token_expire = 0.0
+_baidu_lock = threading.Lock()
+
+
+def _baidu_configured() -> bool:
+    return bool(os.getenv("BAIDU_OCR_API_KEY", "").strip()) and bool(
+        os.getenv("BAIDU_OCR_SECRET_KEY", "").strip()
+    )
+
+
+def _get_baidu_token() -> Optional[str]:
+    """获取百度 access_token（内存缓存，过期前 1 小时提前刷新）。失败返回 None。"""
+    global _baidu_token, _baidu_token_expire
+    api_key = os.getenv("BAIDU_OCR_API_KEY", "").strip()
+    secret_key = os.getenv("BAIDU_OCR_SECRET_KEY", "").strip()
+    if not api_key or not secret_key:
+        return None
+    with _baidu_lock:
+        if _baidu_token and time.time() < _baidu_token_expire:
+            return _baidu_token
+        try:
+            resp = requests.post(
+                BAIDU_TOKEN_URL,
+                params={
+                    "grant_type": "client_credentials",
+                    "client_id": api_key,
+                    "client_secret": secret_key,
+                },
+                timeout=10,
+            )
+            data = resp.json()
+            token = data.get("access_token")
+            if not token:
+                # Key/Secret 错误等；日志只打印脱敏 Key，绝不输出完整密钥
+                print(
+                    f"[baidu] 获取 access_token 失败: {data.get('error', data)} "
+                    f"(Key 脱敏: {_mask_key(api_key)})"
+                )
+                return None
+            _baidu_token = token
+            _baidu_token_expire = time.time() + max(60, int(data.get("expires_in", 2592000)) - 3600)
+            print(f"[baidu] access_token 已获取并缓存（Key 脱敏: {_mask_key(api_key)}）")
+            return _baidu_token
+        except Exception as exc:
+            print(f"[baidu] 获取 access_token 异常: {type(exc).__name__}: {exc}")
+            return None
+
+
+def _baidu_image_payload(img_bytes: bytes) -> str:
+    """图片转 base64；超过百度 4MB 限制时压缩重编码为 JPEG。"""
+    if len(img_bytes) <= 4 * 1024 * 1024:
+        return base64.b64encode(img_bytes).decode("ascii")
+    img = _decode_image(img_bytes)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise RuntimeError("图片压缩失败")
+    print(f"[baidu] 图片超过 4MB，已压缩重编码（{len(img_bytes)} → {buf.nbytes} bytes）")
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def _baidu_ocr(img_bytes: bytes, lang: str) -> Optional[list[dict]]:
+    """百度通用文字识别备用引擎。
+
+    返回值与主引擎同构 [{box, text, conf}]（百度标准接口无置信度 → conf=None）。
+    任何失败（未配置 / 网络异常 / 限流）都返回 None，由调用方沿用主引擎结果。
+    """
+    if not _baidu_configured():
+        print("[baidu] 未配置 BAIDU_OCR_API_KEY/SECRET_KEY，备用引擎跳过")
+        return None
+    token = _get_baidu_token()
+    if token is None:
+        return None
+    language_type = _BAIDU_LANG_MAP.get(lang, "ENG")
+    try:
+        resp = requests.post(
+            BAIDU_OCR_URL,
+            params={"access_token": token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={"image": _baidu_image_payload(img_bytes), "language_type": language_type},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("error_code"):
+            print(
+                f"[baidu] 识别失败 error_code={data.get('error_code')} "
+                f"msg={data.get('error_msg')}"
+            )
+            if data.get("error_code") in (110, 111):  # token 失效 → 清缓存，下次重取
+                global _baidu_token, _baidu_token_expire
+                _baidu_token = None
+                _baidu_token_expire = 0.0
+            return None
+        items: list[dict] = []
+        for w in data.get("words_result", []):
+            loc = w.get("location", {}) or {}
+            items.append(
+                {
+                    "box": [
+                        int(loc.get("left", 0)),
+                        int(loc.get("top", 0)),
+                        int(loc.get("width", 0)),
+                        int(loc.get("height", 0)),
+                    ],
+                    "text": str(w.get("words", "")),
+                    "conf": None,  # 百度标准接口不返回置信度
+                }
+            )
+        print(f"[baidu] 备用引擎识别 {len(items)} 个文本框（lang={language_type}）")
+        return items
+    except Exception as exc:
+        print(f"[baidu] 调用异常: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _ocr_quality_ok(items: list[dict]) -> bool:
+    """主引擎质量判断：非空且（有置信度的条目）平均置信度达标。
+
+    - 空结果 → False（调用方可触发一次备用）
+    - 全部条目无置信度（百度结果等）→ True（不触发）
+    - 平均置信度 < BAIDU_TRIGGER_CONFIDENCE → False
+    """
+    if not items:
+        return False
+    confs = [it["conf"] for it in items if isinstance(it.get("conf"), (int, float))]
+    if not confs:
+        return True
+    avg = sum(confs) / len(confs)
+    return avg >= BAIDU_TRIGGER_CONFIDENCE
+
+
 # ===== 翻译结果缓存（TranslationCache 表，模型定义在 main.py） =====
 # 同一张图（按内容 SHA256 唯一）不重复跑 OCR + 大模型，节省时间与 API 额度。
 # 注意：函数内延迟 import main，避免模块加载期的循环导入。
@@ -387,8 +601,12 @@ def _cache_get(image_hash: str) -> Optional[str]:
         return None
 
 
-def _cache_put(image_hash: str, image_url: str, result: list[dict]) -> None:
-    """写入缓存（已存在同 hash 时跳过；写失败不影响主流程）。"""
+def _cache_put(image_hash: str, image_url: str, result: list[dict], overwrite: bool = False) -> None:
+    """写入缓存（已存在同 hash 时默认跳过；overwrite=True 用于备用引擎结果覆盖空结果）。
+
+    场景：主引擎空结果先写缓存 → 百度备用识别出文字 → 覆盖缓存，避免下次同图
+    再跑一次 OCR 才发现"缓存里的空结果其实是误判"。
+    """
     try:
         from main import SessionLocal, TranslationCache
 
@@ -396,6 +614,9 @@ def _cache_put(image_hash: str, image_url: str, result: list[dict]) -> None:
         try:
             exists = db.query(TranslationCache).filter(TranslationCache.image_hash == image_hash).first()
             if exists:
+                if overwrite and exists.result_json != json.dumps(result, ensure_ascii=False):
+                    exists.result_json = json.dumps(result, ensure_ascii=False)
+                    db.commit()
                 return
             db.add(
                 TranslationCache(
@@ -479,18 +700,55 @@ async def translate_comic(request: Request):
             detail=f"OCR 引擎初始化失败：{exc}。首次运行需联网下载模型，或手动把模型放到 ~/.paddlex/official_models/ 目录",
         )
 
+    # ===== 主引擎：PaddleOCR Mobile（信号量限流，防止并发推理撑爆内存） =====
+    items: list[dict] = []
+    ocr_error: Optional[Exception] = None
     try:
-        raw_result = ocr.predict(img)
+        acquired = _ocr_semaphore.acquire(timeout=_OCR_QUEUE_TIMEOUT)
+        if not acquired:
+            raise HTTPException(status_code=503, detail="OCR 排队超时（服务繁忙），请稍后重试")
+        try:
+            raw_result = ocr.predict(img)
+        finally:
+            _ocr_semaphore.release()
+        items = _parse_ocr_result(raw_result)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"OCR 识别失败：{exc}")
+        ocr_error = exc
 
-    items = _parse_ocr_result(raw_result)
-    # 强制排查：打印 OCR 原始识别结果（文本 + box），定位"第一页没翻译"断在哪一环
-    print(f"[translate] OCR 原始识别 {len(items)} 个文本框:")
-    for it in items:
-        print(f"[translate]   {it['text']!r} box={it['box']}")
+    # 强制排查：打印主引擎原始识别结果（文本 + box + 置信度）
+    if ocr_error is None:
+        print(f"[translate] 主引擎(PaddleOCR) 原始识别 {len(items)} 个文本框:")
+        for it in items:
+            conf = it.get("conf")
+            conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else "N/A"
+            print(f"[translate]   {it['text']!r} box={it['box']} conf={conf_str}")
+
+    # ===== 质量判断 + 备用引擎降级 =====
+    # 触发条件：主引擎异常，或有框但平均置信度偏低，或空结果（触发一次百度兜底）。
+    # 防重复调用：任何结果（含空）最终都会写入缓存，同图第二次请求直接命中缓存，
+    # 不会再触发百度 API。
+    engine = "paddle"
+    if ocr_error is not None or not _ocr_quality_ok(items):
+        reason = (
+            f"主引擎异常: {type(ocr_error).__name__}: {ocr_error}"
+            if ocr_error is not None
+            else (f"主引擎 0 个文本框" if not items else f"平均置信度偏低")
+        )
+        print(f"[translate] 质量判断未通过（{reason}），尝试百度备用引擎")
+        baidu_items = _baidu_ocr(img_bytes, lang)
+        if baidu_items is not None:
+            engine = "baidu"
+            print(f"[translate] 已切换备用引擎结果（百度 {len(baidu_items)} 个文本框）")
+            items = baidu_items
+        elif ocr_error is not None:
+            # 主引擎失败且备用不可用 → 保持原有错误行为
+            raise HTTPException(status_code=500, detail=f"OCR 识别失败：{ocr_error}")
+        # 百度不可用但主引擎只是质量偏低 → 沿用主引擎结果继续翻译
+
     if not items:
-        print("[translate] OCR 未识别到任何文本（返回空数组）")
+        print("[translate] 两个引擎均未识别到文本（图片本身无文字，返回空数组）")
         _cache_put(cache_key, str(image_url or ""), [])
         print("[新图翻译并写入缓存] 空结果也写入缓存")
         return []
@@ -523,6 +781,7 @@ async def translate_comic(request: Request):
         for i, it in enumerate(items)
     ]
     # 新图翻译完成：结果写入缓存，下次同图直接命中
-    _cache_put(cache_key, str(image_url or ""), result)
-    print(f"[新图翻译并写入缓存] hash={cache_key[:16]}… 共 {len(result)} 条气泡")
+    # 备用引擎结果覆盖写入（主引擎可能先写过空/低质量缓存）
+    _cache_put(cache_key, str(image_url or ""), result, overwrite=(engine == "baidu"))
+    print(f"[新图翻译并写入缓存] 引擎={engine} hash={cache_key[:16]}… 共 {len(result)} 条气泡")
     return result

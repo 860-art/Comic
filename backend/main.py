@@ -14,6 +14,7 @@ AoliComic 后端服务入口（FastAPI + SQLAlchemy + SQLite）。
 
 import json
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -547,10 +548,30 @@ app.add_middleware(
     allow_headers=["*"],  # 全部请求头
 )
 
-# ===== OCR 漫画翻译（PaddleOCR + OpenCV 取色 + GLM/DeepSeek），详见 ocr_translate.py =====
+# ===== OCR 漫画翻译（PaddleOCR Mobile + 百度备用 + OpenCV 取色 + GLM/DeepSeek）=====
 from ocr_translate import router as translate_router  # noqa: E402
 
 app.include_router(translate_router)
+
+
+# 启动时后台预热 OCR 模型（加载常驻内存，避免首个用户请求承担模型加载等待）。
+# 后台线程执行，不阻塞 uvicorn 启动；失败仅打日志，首次请求时自动重试（懒加载兜底）。
+# OCR_WARMUP=0 可关闭（如调试时不希望启动就加载 paddle）。
+@app.on_event("startup")
+def _warmup_ocr_on_startup() -> None:
+    if os.getenv("OCR_WARMUP", "1").strip().lower() in ("0", "false", "off"):
+        print("[warmup] OCR_WARMUP=0，跳过 OCR 模型预热")
+        return
+
+    def _run() -> None:
+        try:
+            from ocr_translate import warmup_ocr  # noqa: E402
+
+            warmup_ocr("en")  # 前端默认语言，预热最高频的引擎
+        except Exception as exc:
+            print(f"[warmup] OCR 预热线程异常（不影响服务）: {type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_run, daemon=True, name="ocr-warmup").start()
 
 
 @app.get("/api/health")
