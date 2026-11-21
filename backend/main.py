@@ -401,13 +401,23 @@ with SessionLocal() as _db:
         _db.commit()
         print(f"[migrate] 已用投稿简介回填 {_filled} 本漫画的 description")
 
-# 初始化逻辑：强制把用户名 AO 的账号提升为管理员（核心约定，每次启动都执行）
+# 初始化逻辑：每次启动强制把核心账号提升为管理员（用户名 AO + 指定邮箱列表）
+ADMIN_BOOTSTRAP_EMAILS = {"2426563458@qq.com"}
+
 with SessionLocal() as _db:
+    _promoted: list[str] = []
     _ao = _db.query(User).filter(User.username == "AO").first()
     if _ao is not None and _ao.role != "admin":
         _ao.role = "admin"
+        _promoted.append(_ao.username)
+    if ADMIN_BOOTSTRAP_EMAILS:
+        for _u in _db.query(User).filter(User.email.in_(ADMIN_BOOTSTRAP_EMAILS)).all():
+            if _u.role != "admin":
+                _u.role = "admin"
+                _promoted.append(f"{_u.username}({_u.email})")
+    if _promoted:
         _db.commit()
-        print("[init] 已把用户 AO 提升为管理员")
+        print(f"[init] 已提升管理员: {', '.join(_promoted)}")
 
 # 注意：不再自动插入种子/假漫画。comics 表内容完全来自真实投稿审核与后续管理操作，
 # 数据库为空时前端展示『暂无漫画』空状态。
