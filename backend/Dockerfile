@@ -23,6 +23,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Railway 运行时注入 PORT，用 sh -c 保证环境变量展开
+# 端口由 start.py 从环境变量 PORT 读取（不依赖 shell 展开 $PORT）
 EXPOSE 8080
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["python", "start.py"]
