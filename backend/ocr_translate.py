@@ -16,6 +16,7 @@
 """
 
 import base64
+import gc
 import hashlib
 import json
 import os
@@ -78,9 +79,26 @@ def _get_ocr(lang: str):
         if lang not in _ocr_instances:
             from paddleocr import PaddleOCR  # 延迟导入：未安装 paddle 时其它接口不受影响
 
-            # enable_mkldnn=False：paddle 3.3.1 的 onednn 执行器存在
-            # ConvertPirAttribute2RuntimeAttribute 兼容 bug，CPU 推理必须走纯 CPU 算子
-            base_kwargs = dict(
+            # ===== 性能调优参数（2核4G 小内存服务器实测配置）=====
+            # - enable_mkldnn=True：启用 MKLDNN 加速 CPU 推理
+            # - rec_batch_num=1：识别批大小压到 1，内存峰值最低（漫画逐行识别足够）
+            # - use_angle_cls=False：漫画文字固定正向，跳过方向分类省时省内存
+            # - cpu_math_library_num_threads=2：CPU 数学库线程数对齐 2 核
+            # - det_limit_side_len=960：检测输入边长限制，大图先缩放，控内存与耗时
+            tuned_kwargs = dict(
+                lang=lang,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                enable_mkldnn=True,
+                rec_batch_num=1,
+                use_angle_cls=False,
+                cpu_math_library_num_threads=2,
+                det_limit_side_len=960,
+            )
+            # 兜底安全配置：调优参数在当前 paddle 版本不可用（初始化报错）时回退，
+            # mkldnn 关闭走纯 CPU 算子（paddle 3.3.1 onednn 存在兼容 bug 的场景）
+            safe_kwargs = dict(
                 lang=lang,
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
@@ -93,18 +111,33 @@ def _get_ocr(lang: str):
                     _ocr_instances[lang] = PaddleOCR(
                         text_detection_model_name=_MOBILE_DET,
                         text_recognition_model_name=_KOREAN_MOBILE_REC,
-                        **base_kwargs,
+                        **tuned_kwargs,
                     )
                 else:
                     _ocr_instances[lang] = PaddleOCR(
                         text_detection_model_name=_MOBILE_DET,
                         text_recognition_model_name=_MOBILE_REC,
-                        **base_kwargs,
+                        **tuned_kwargs,
                     )
             except Exception as exc:
-                # 兜底：显式 Mobile 模型在当前环境不可用时回退默认（保证功能不中断）
-                print(f"[ocr] Mobile 模型初始化失败，回退默认模型: {type(exc).__name__}: {exc}")
-                _ocr_instances[lang] = PaddleOCR(**base_kwargs)
+                # 兜底：调优参数不可用时回退安全配置（保证功能不中断）
+                print(f"[ocr] 调优参数初始化失败，回退安全配置: {type(exc).__name__}: {exc}")
+                try:
+                    if lang == "korean":
+                        _ocr_instances[lang] = PaddleOCR(
+                            text_detection_model_name=_MOBILE_DET,
+                            text_recognition_model_name=_KOREAN_MOBILE_REC,
+                            **safe_kwargs,
+                        )
+                    else:
+                        _ocr_instances[lang] = PaddleOCR(
+                            text_detection_model_name=_MOBILE_DET,
+                            text_recognition_model_name=_MOBILE_REC,
+                            **safe_kwargs,
+                        )
+                except Exception as exc2:
+                    print(f"[ocr] Mobile 模型初始化失败，回退默认模型: {type(exc2).__name__}: {exc2}")
+                    _ocr_instances[lang] = PaddleOCR(**safe_kwargs)
         return _ocr_instances[lang]
 
 
@@ -890,3 +923,187 @@ async def translate_comic(request: Request):
     _cache_put(cache_key, str(image_url or ""), result, overwrite=(engine == "baidu"))
     print(f"[新图翻译并写入缓存] 引擎={engine} hash={cache_key[:16]}… 共 {len(result)} 条气泡")
     return result
+
+
+# ===== 批量 OCR 接口：POST /api/ocr/batch =====
+# 面向整章多图的纯识别（不走 LLM 翻译）：
+# - 对象存储里的图一张一张串行取（绝不并发跑 OCR，信号量逐张持有）
+# - 每张处理完立即 del + gc.collect() 释放内存，2核4G 服务器稳定
+# - 保存每个文本框的四点坐标（按原图宽高归一化到 0~1）和文本为 JSON
+# - 单张失败自动重试 2 次（共 3 次尝试），重试耗尽后记录错误继续下一张，不影响整批
+
+
+def _parse_ocr_items_normalized(raw, img_w: int, img_h: int) -> list[dict]:
+    """解析 OCR 原始结果 → 每个文本框的【四点坐标（按原图尺寸归一化 0~1）】+ 文本 + 置信度。
+
+    兼容 PaddleOCR 3.x（dict: rec_texts/rec_polys/rec_scores）与 2.x（嵌套 list）。
+    四点顺序与 rec_polys 一致：左上 → 右上 → 右下 → 左下。
+    """
+    items: list[dict] = []
+    if raw is None:
+        return items
+    first = raw[0] if isinstance(raw, list) else raw
+    if isinstance(first, dict):
+        texts = _result_field(first, "rec_texts")
+        polys = _result_field(first, "rec_polys")
+        scores = _result_field(first, "rec_scores")
+        for i, text in enumerate(texts):
+            if i >= len(polys) or polys[i] is None:
+                continue
+            try:
+                pts = [(float(p[0]), float(p[1])) for p in polys[i]]
+            except Exception:
+                continue
+            if len(pts) < 4:
+                continue
+            norm = [
+                [round(x / img_w, 6), round(y / img_h, 6)]
+                for x, y in pts[:4]
+            ]
+            conf = None
+            if i < len(scores):
+                try:
+                    conf = round(float(scores[i]), 4)
+                except (TypeError, ValueError):
+                    conf = None
+            items.append({"poly": norm, "text": str(text), "conf": conf})
+        return items
+
+    # 2.x：[[poly, (text, conf)], ...]
+    for entry in raw:
+        try:
+            poly, pair = entry[0], entry[1]
+            pts = [(float(p[0]), float(p[1])) for p in poly]
+            if len(pts) < 4:
+                continue
+            norm = [
+                [round(x / img_w, 6), round(y / img_h, 6)]
+                for x, y in pts[:4]
+            ]
+            conf = None
+            try:
+                conf = round(float(pair[1]), 4)
+            except (TypeError, ValueError, IndexError):
+                conf = None
+            items.append({"poly": norm, "text": str(pair[0]), "conf": conf})
+        except Exception:
+            continue
+    return items
+
+
+@router.post("/api/ocr/batch")
+async def ocr_batch(request: Request):
+    """批量 OCR（纯识别，不调用大模型翻译）。
+
+    请求：application/json
+        {"image_urls": ["https://r2/.../p1.png", "..."], "lang": "en"}
+
+    处理策略：
+    - 一张一张串行下载 + 识别（不并发跑 OCR），逐张持有信号量保护资源
+    - 每张处理完（成功或失败）立即 del + gc.collect() 释放内存
+    - 单张失败自动重试 2 次（共 3 次尝试，间隔 1 秒），重试耗尽记录错误、继续下一张
+    - 返回每个文本框的四点坐标（按原图尺寸归一化 0~1）与文本
+
+    返回：
+        {"lang": "en", "total": N, "success": M, "results": [
+            {"index": 0, "image_url": "...", "ok": true, "attempts": 1,
+             "image_width": 800, "image_height": 1200,
+             "items": [{"poly": [[0.1,0.2],[0.5,0.2],[0.5,0.25],[0.1,0.25]],
+                        "text": "Hello", "conf": 0.98}],
+             "error": null},
+            ...
+        ]}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请用 application/json 提交")
+    urls = body.get("image_urls")
+    if not isinstance(urls, list) or not urls:
+        raise HTTPException(status_code=400, detail="image_urls 必须是非空字符串数组")
+    # 单次批量上限：防止极端长列表把串行队列拖到不可用
+    urls = [str(u) for u in urls if str(u).strip()][:50]
+    if not urls:
+        raise HTTPException(status_code=400, detail="image_urls 里没有有效地址")
+
+    lang = SUPPORTED_LANGS.get(str(body.get("lang") or "en").lower())
+    if lang is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的语言，可选：{sorted(set(SUPPORTED_LANGS.values()))}",
+        )
+
+    try:
+        ocr = _get_ocr(lang)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"OCR 引擎初始化失败：{exc}。首次运行需联网下载模型，或手动把模型放到 ~/.paddlex/official_models/ 目录",
+        )
+
+    results: list[dict] = []
+    for idx, url in enumerate(urls):
+        img_bytes: Optional[bytes] = None
+        img = None
+        raw = None
+        ok = False
+        attempts = 0
+        error_msg: Optional[str] = None
+        items: list[dict] = []
+        img_w: Optional[int] = None
+        img_h: Optional[int] = None
+
+        # 首次尝试 + 重试 2 次（共 3 次）；任何一步失败都重试整张
+        for attempt in (1, 2, 3):
+            attempts = attempt
+            try:
+                # 串行取图：上一张彻底处理完才取下一张
+                img_bytes = _fetch_image_bytes(url)
+                img = _decode_image(img_bytes)
+                img_h, img_w = img.shape[:2]
+                acquired = _ocr_semaphore.acquire(timeout=_OCR_QUEUE_TIMEOUT)
+                if not acquired:
+                    raise RuntimeError(f"OCR 排队超时（{_OCR_QUEUE_TIMEOUT}s）")
+                try:
+                    raw = ocr.predict(img)
+                finally:
+                    _ocr_semaphore.release()
+                items = _parse_ocr_items_normalized(raw, img_w, img_h)
+                ok = True
+                break
+            except Exception as exc:
+                error_msg = f"{type(exc).__name__}: {exc}"
+                print(f"[ocr-batch] 第 {idx + 1} 张第 {attempt} 次尝试失败: {error_msg}")
+                img = None
+                img_bytes = None
+                raw = None
+                gc.collect()
+                if attempt < 3:
+                    time.sleep(1)
+
+        results.append(
+            {
+                "index": idx,
+                "image_url": url,
+                "ok": ok,
+                "attempts": attempts,
+                "image_width": img_w,
+                "image_height": img_h,
+                "items": items,
+                "error": None if ok else error_msg,
+            }
+        )
+        print(
+            f"[ocr-batch] 第 {idx + 1}/{len(urls)} 张完成: "
+            f"{'成功' if ok else '失败'}(尝试 {attempts} 次) 识别 {len(items)} 个文本框"
+        )
+
+        # 单张处理结束：彻底释放本张内存再进入下一张
+        img = None
+        img_bytes = None
+        raw = None
+        gc.collect()
+
+    success = sum(1 for r in results if r["ok"])
+    print(f"[ocr-batch] 批次完成：{success}/{len(urls)} 张成功（lang={lang}）")
+    return {"lang": lang, "total": len(urls), "success": success, "results": results}
