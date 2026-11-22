@@ -10,6 +10,7 @@ import {
   ChevronRight,
   Languages,
   Loader2,
+  RotateCcw,
   X,
 } from "lucide-react";
 import { ROUTES } from "@/lib/navigation";
@@ -107,7 +108,7 @@ export default function ComicReadPage({
     }
   };
   // 每页独立的翻译状态：idle 未翻译 / loading 翻译中 / success 已翻译（流式渲染，互不阻塞）
-  type PageTranslateStatus = "idle" | "loading" | "success";
+  type PageTranslateStatus = "idle" | "loading" | "success" | "error";
   const [pageStatus, setPageStatus] = useState<Record<number, PageTranslateStatus>>({});
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   // 翻译抽屉内的设置：翻译方式 Tab / 图片文字识别开关 / 识别质量滑动条
@@ -266,6 +267,50 @@ export default function ComicReadPage({
   const hasEmptyPage = successEntries.some(([i]) => (translations[Number(i)] ?? []).length === 0);
   const hasTranslation = Object.keys(translations).length > 0;
 
+  // 每页翻译开始时间（毫秒时间戳）：用于「翻译超过 2 分钟」的卡死判定
+  const pageStartRef = useRef<Record<number, number>>({});
+  // 滴答时钟：仅存在翻译中的页面时每 10 秒触发一次重渲染，驱动超时按钮出现
+  const [nowTick, setNowTick] = useState(0);
+  useEffect(() => {
+    if (!anyLoading) return;
+    const timer = setInterval(() => setNowTick(Date.now()), 10000);
+    return () => clearInterval(timer);
+  }, [anyLoading]);
+
+  /** 单页翻译请求：force=true 时让后端清掉该页旧缓存重跑；失败标记 error 而不是静默回 idle */
+  const translateOnePage = async (
+    src: string,
+    i: number,
+    force: boolean
+  ): Promise<boolean> => {
+    setPageStatus((prev) => ({ ...prev, [i]: "loading" }));
+    pageStartRef.current[i] = Date.now();
+    try {
+      const res = await fetch(`${API_BASE}/api/translate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // BYOK：带上用户自己保存的 Key（为空时后端自动降级服务器 Key）
+        body: JSON.stringify({
+          image_url: src,
+          lang: "en",
+          api_key: savedKey.trim(),
+          force,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && Array.isArray(data)) {
+        setTranslations((prev) => ({ ...prev, [i]: data as TranslateBubble[] }));
+        setPageStatus((prev) => ({ ...prev, [i]: "success" }));
+        return true;
+      }
+      setPageStatus((prev) => ({ ...prev, [i]: "error" }));
+      return false;
+    } catch {
+      setPageStatus((prev) => ({ ...prev, [i]: "error" }));
+      return false;
+    }
+  };
+
   const runTranslate = async (force = false) => {
     const pages = images;
     if (!pages || pages.length === 0) {
@@ -287,51 +332,55 @@ export default function ComicReadPage({
       setPageStatus({});
     }
 
-    // 并发发起 N 个独立请求（不用 await Promise.all 阻塞渲染）：
-    // 每页只更新自己的状态，哪个先返回哪个先渲染
-    let failDetail = "";
-    const jobs = pages.map(async (src, i): Promise<boolean> => {
-      setPageStatus((prev) => ({ ...prev, [i]: "loading" }));
-      try {
-        const res = await fetch(`${API_BASE}/api/translate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          // BYOK：带上用户自己保存的 Key（为空时后端自动降级服务器 Key）
-          // force：重新翻译时让后端清掉旧缓存重跑，避免命中旧的伪翻译/混入原文结果
-          body: JSON.stringify({
-            image_url: src,
-            lang: "en",
-            api_key: savedKey.trim(),
-            force,
-          }),
-        });
-        const data = await res.json().catch(() => null);
-        if (res.ok && Array.isArray(data)) {
-          setTranslations((prev) => ({ ...prev, [i]: data as TranslateBubble[] }));
-          setPageStatus((prev) => ({ ...prev, [i]: "success" }));
-          return true;
-        }
-        const detail = (data as { detail?: string } | null)?.detail;
-        if (detail) failDetail = detail;
-        setPageStatus((prev) => ({ ...prev, [i]: "idle" }));
-        return false;
-      } catch {
-        setPageStatus((prev) => ({ ...prev, [i]: "idle" }));
-        return false;
-      }
-    });
+    // 分批并发（每批 3 页）：后端 OCR 推理有信号量限流，全量并发会让排队页 503 失败；
+    // 小批次压满限流额度即可，失败率最低，先返回的页面依然先渲染
+    const BATCH = 3;
+    let okCount = 0;
+    for (let start = 0; start < pages.length; start += BATCH) {
+      const batch = pages
+        .slice(start, start + BATCH)
+        .map((src, k) => translateOnePage(src, start + k, force));
+      const results = await Promise.all(batch);
+      okCount += results.filter(Boolean).length;
+    }
 
-    // Promise.allSettled 只用于最终统计 Toast，不阻塞任何页面的渲染
-    const results = await Promise.allSettled(jobs);
-    const okCount = results.filter((r) => r.status === "fulfilled" && r.value).length;
     setToastMsg(
       okCount === pages.length
         ? `全部 ${pages.length} 页翻译完成`
-        : okCount === 0
-          ? failDetail || "翻译失败，请确认后端已启动"
-          : `完成 ${okCount}/${pages.length} 页，其余可稍后重试`
+        : `完成 ${okCount}/${pages.length} 页，失败页可点右上角「重新翻译」`
+    );
+    setTimeout(() => setToastMsg(null), 2800);
+  };
+
+  /** 单页重新翻译：只清空该页译文与状态、force 重译该页，已成功的页面完全不受影响 */
+  const retryPage = async (i: number) => {
+    const src = images?.[i];
+    if (!src || pageStatus[i] === "loading") return;
+    setShowTranslated(true);
+    // 清空该页相关数据（旧译文 + 状态）后重新提交翻译
+    setTranslations((prev) => {
+      const next = { ...prev };
+      delete next[i];
+      return next;
+    });
+    const ok = await translateOnePage(src, i, true);
+    setToastMsg(
+      ok
+        ? `第 ${i + 1} 页翻译完成`
+        : `第 ${i + 1} 页翻译失败，可再次点击「重新翻译」重试`
     );
     setTimeout(() => setToastMsg(null), 2500);
+  };
+
+  /** 该页是否显示右上角「重新翻译」按钮：翻译失败，或翻译中已超过 2 分钟（疑似卡死） */
+  const pageStuck = (i: number): boolean => {
+    const status = pageStatus[i];
+    if (status === "error") return true;
+    if (status === "loading") {
+      const started = pageStartRef.current[i];
+      return started != null && nowTick > 0 && Date.now() - started > 120000;
+    }
+    return false;
   };
 
   // 底部主按钮：拦截无密钥 → 关闭抽屉并调用真实翻译
@@ -465,6 +514,18 @@ export default function ComicReadPage({
                         AI 汉化中<span className="animate-pulse">...</span>
                       </p>
                     </div>
+                  )}
+                  {/* 右上角「重新翻译」：该页失败，或翻译中超过 2 分钟疑似卡死时出现；
+                      点击只重译这一页（清空该页旧数据 force 重跑），已完成的页面不受影响 */}
+                  {showTranslated && pageStuck(i) && (
+                    <button
+                      type="button"
+                      onClick={() => retryPage(i)}
+                      className="absolute right-3 top-3 z-20 flex items-center gap-1.5 rounded-full border border-white/25 bg-black/75 px-3 py-1.5 text-xs font-medium text-white shadow-lg backdrop-blur-md transition-transform hover:bg-black/90 active:scale-95"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      重新翻译
+                    </button>
                   )}
                   {/* 翻译气泡覆盖层：按后端 box 坐标换算百分比定位；
                       背景用取色 bg_color 加 80% 透明度 + backdrop-blur；文字按背景亮度自动黑/白 */}
