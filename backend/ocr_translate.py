@@ -15,6 +15,7 @@
 两者都没配置 → 伪翻译，方便先联调前端。
 """
 
+import ast
 import base64
 import gc
 import hashlib
@@ -448,6 +449,52 @@ def _mask_key(key: str) -> str:
     return f"{key[:4]}****{key[-4:]}"
 
 
+def _parse_llm_array(content: str, expected: int) -> Optional[list[str]]:
+    """容错解析 LLM 返回的 JSON 数组。
+
+    实测日志：模型明明给出了 5 条正确中文译文，却因 `Unterminated string`
+    （引号未闭合 / 裸换行 / 全角引号 / 结尾多余解释）被 json.loads 整批丢弃。
+    这里按「清洗 → 宽松解析 → 正则兜底」多层救回，最后仍强制等长校验，
+    绝不把错位译文写进结果。
+    """
+    s = (content or "").strip()
+    if not s:
+        return None
+    # 1) markdown 代码围栏：```json [...] ``` / ``` [...] ```
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+    # 2) 只取第一个 [ 到最后一个 ]，丢掉模型爱加的「以下是翻译：」等解释文字
+    lb, rb = s.find("["), s.rfind("]")
+    if lb >= 0 and rb > lb:
+        s = s[lb : rb + 1]
+    # 3) 中文引号 → 半角引号（模型偶发）
+    s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+
+    # 4) 依次尝试：宽松 JSON（strict=False 放行字符串内裸换行/控制字符）→ Python 字面量
+    for loader in (lambda x: json.loads(x, strict=False), ast.literal_eval):
+        try:
+            parsed = loader(s)
+        except Exception:
+            continue
+        if isinstance(parsed, (list, tuple)) and len(parsed) == expected:
+            return [str(t) for t in parsed]
+
+    # 5) 终极兜底：引号未闭合/数组被截断时，抓出所有完整引号串
+    #    （要求数量完全等于输入，且后面还有纯中文校验，安全）
+    strs = re.findall(r'"([^"]*)"', s)
+    if len(strs) == expected - 1:
+        # 末尾少一个闭合引号（Unterminated string 的典型形态）→ 补上最后一段文本
+        tail = s.rfind('"')
+        frag = s[tail + 1 :].rstrip("] \t\r\n, 、")
+        if frag.strip():
+            strs.append(frag.strip())
+    if len(strs) == expected and all(t.strip() for t in strs):
+        print("[translate] JSON 严格解析失败，已用引号串兜底提取译文")
+        return [t.strip() for t in strs]
+    return None
+
+
 def _llm_translate_once(
     texts: list[str], user_api_key: str = "", temperature: float = 0.3
 ) -> Optional[list[str]]:
@@ -499,13 +546,12 @@ def _llm_translate_once(
         full_resp = resp.json()
         print(f"[translate] LLM 完整 response: {json.dumps(full_resp, ensure_ascii=False)[:800]}")
         content = full_resp["choices"][0]["message"]["content"].strip()
-        print(f"[translate] LLM 返回正文: {content}")
-        # 模型偶尔包 ```json ... ```，剥掉再解析
-        if content.startswith("```"):
-            content = content.strip("`").lstrip("json").strip()
-        parsed = json.loads(content)
-        if isinstance(parsed, list) and len(parsed) == len(texts):
-            return [str(t) for t in parsed]
+        # repr 打印：裸换行 / \r / 全角引号等隐藏字符会原形毕露，便于排查
+        print(f"[translate] LLM 返回正文: {content!r}")
+        # 多层容错解析（围栏、裸控制字符、全角引号、引号未闭合），并强制等长
+        parsed = _parse_llm_array(content, len(texts))
+        if parsed is not None:
+            return parsed
     except Exception as exc:
         # 强制排查：任何网络/解析异常都打在终端里
         print(f"[translate] LLM 调用异常: {type(exc).__name__}: {exc}")
