@@ -33,6 +33,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    func,
     inspect,
     or_,
     text,
@@ -1661,9 +1662,21 @@ def create_post(
 
 @app.get("/api/posts")
 def list_posts(db: Session = Depends(get_db)):
-    """帖子列表：按创建时间倒序，relationship 带出作者用户名。"""
+    """帖子列表：按创建时间倒序，relationship 带出作者用户名；附带真实评论数。"""
     posts = db.query(Post).order_by(Post.created_at.desc(), Post.id.desc()).all()
-    return [post_to_dict(p) for p in posts]
+    # 批量统计每条动态的评论数（评论以 comment 通知的形式存储），避免 N+1 查询
+    counts = dict(
+        db.query(Notification.post_id, func.count(Notification.id))
+        .filter(Notification.type == "comment", Notification.post_id.isnot(None))
+        .group_by(Notification.post_id)
+        .all()
+    )
+    result = []
+    for p in posts:
+        d = post_to_dict(p)
+        d["comment_count"] = counts.get(p.id, 0)
+        result.append(d)
+    return result
 
 
 @app.delete("/api/posts/{post_id}")
@@ -1684,19 +1697,40 @@ def delete_post(
 
 
 # ===== 帖子互动：点赞 / 评论（产生真实互动通知） =====
+@app.get("/api/posts/liked")
+def my_liked_posts(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """当前用户赞过的动态 id 列表（前端红心初始状态的数据源）。"""
+    rows = (
+        db.query(Notification.post_id)
+        .filter(
+            Notification.type == "like",
+            Notification.actor_id == user.id,
+            Notification.post_id.isnot(None),
+        )
+        .all()
+    )
+    return {"post_ids": [r[0] for r in rows]}
+
+
 @app.post("/api/posts/{post_id}/like")
 def like_post(
     post_id: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """点赞动态：计数 +1 并给作者产生 like 通知；不能赞自己、不能重复赞。"""
+    """点赞/取消点赞（切换）：已赞时再次调用即取消红心。
+
+    已赞记录以 notifications 表的 like 通知为准：
+    点赞 → 计数 +1 并给作者产生通知；取消 → 删除该通知、计数 -1。
+    """
     post = db.query(Post).filter(Post.id == post_id).first()
     if post is None:
         raise HTTPException(status_code=404, detail="帖子不存在")
     if post.author_id == user.id:
         raise HTTPException(status_code=400, detail="不能给自己的动态点赞")
-    # 防重复：同一用户对同一帖子只允许一条 like 通知
     dup = (
         db.query(Notification)
         .filter(
@@ -1707,7 +1741,11 @@ def like_post(
         .first()
     )
     if dup is not None:
-        raise HTTPException(status_code=400, detail="已经赞过这条动态了")
+        # 已赞 → 取消：计数 -1 并同步撤销作者收到的点赞通知
+        post.likes = max(0, post.likes - 1)
+        db.delete(dup)
+        db.commit()
+        return {"message": "已取消点赞", "likes": post.likes, "liked": False}
     post.likes += 1
     db.add(
         Notification(
@@ -1715,7 +1753,34 @@ def like_post(
         )
     )
     db.commit()
-    return {"message": "点赞成功", "likes": post.likes}
+    return {"message": "点赞成功", "likes": post.likes, "liked": True}
+
+
+@app.get("/api/posts/{post_id}/comments")
+def list_post_comments(
+    post_id: int,
+    db: Session = Depends(get_db),
+):
+    """读取某条动态的评论列表（评论以 comment 通知的形式存储，公开可读）。"""
+    if db.query(Post).filter(Post.id == post_id).first() is None:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+    rows = (
+        db.query(Notification)
+        .filter(Notification.type == "comment", Notification.post_id == post_id)
+        .order_by(Notification.id.asc())
+        .all()
+    )
+    return [
+        {
+            "id": n.id,
+            "actor_id": n.actor_id,
+            "actor_username": n.actor.username,
+            "actor_avatar": n.actor.avatar_url,
+            "content": n.content,
+            "created_at": n.created_at.replace(tzinfo=timezone.utc).isoformat(),
+        }
+        for n in rows
+    ]
 
 
 class PostCommentRequest(BaseModel):

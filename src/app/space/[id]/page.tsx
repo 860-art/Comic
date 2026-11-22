@@ -1,13 +1,25 @@
 /* eslint-disable @next/next/no-img-element */
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, AtSign } from "lucide-react";
+import {
+  ArrowLeft,
+  AtSign,
+  ChevronLeft,
+  ChevronRight,
+  Heart,
+  MessageCircle,
+  X,
+} from "lucide-react";
+import CommentDrawer from "@/components/CommentDrawer";
+import { type CommentItem } from "@/data/comments";
 import {
   SPACE_USERS,
   ME_DEFAULT_AVATAR,
   ME_DEFAULT_BANNER,
+  ME_DEFAULT_NAME,
+  displayTitle,
   formatFans,
   getUserStats,
   loadFollowIds,
@@ -18,13 +30,42 @@ import {
   type UserStats,
 } from "@/data/posts";
 import { API_BASE } from "@/lib/api";
+import { getAuth, getToken } from "@/lib/auth";
 import { formatTime } from "@/lib/time";
+
+/** 本地假数据帖子的评论存储（与广场页同 key，评论互通） */
+const COMMENTS_KEY = "sq_post_comments";
+
+function loadLocalComments(postId: string): CommentItem[] {
+  try {
+    const raw = window.localStorage.getItem(COMMENTS_KEY);
+    if (!raw) return [];
+    const map = JSON.parse(raw);
+    return Array.isArray(map?.[postId]) ? map[postId] : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalComments(postId: string, list: CommentItem[]) {
+  try {
+    const raw = window.localStorage.getItem(COMMENTS_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    map[postId] = list;
+    window.localStorage.setItem(COMMENTS_KEY, JSON.stringify(map));
+  } catch {
+    // 忽略存储异常
+  }
+}
 
 /**
  * 他人空间页（/space/[id]）：
  * - 从广场/评论区点击他人头像或名字进入
  * - 假数据用户（u1~u9）沿用本地帖子；真实数据库用户（authorId 为数字 id）
  *   走 GET /api/users/{id} + GET /api/posts，展示真实头像/背景/动态
+ * - 无头像/背景 → 加载全站默认图（网络加载失败同样兜底）
+ * - 动态卡片：底部点赞（红心可切换）+ 评论（复用全站评论抽屉）
+ * - 配图点击放大：全屏遮罩浏览，多图支持左右切换
  * - 关注按钮：点击变灰色『已关注』并写入 localStorage('follows')，粉丝数实时 +1
  */
 
@@ -38,7 +79,40 @@ interface ApiPost {
   author_id: number;
   author_username: string;
   likes: number;
+  comment_count?: number;
   created_at: string;
+}
+
+/** 后端 GET /api/posts/{id}/comments 返回的单条评论 */
+interface ApiComment {
+  id: number;
+  actor_id: number;
+  actor_username: string;
+  actor_avatar?: string | null;
+  content: string;
+  created_at: string;
+}
+
+/** 评论颜色池：CommentItem 需要的无头像兜底背景 */
+const COMMENT_COLORS = [
+  "bg-violet-500",
+  "bg-sky-500",
+  "bg-emerald-500",
+  "bg-amber-500",
+  "bg-rose-500",
+];
+
+function apiCommentToItem(c: ApiComment): CommentItem {
+  return {
+    id: `c-${c.id}`,
+    author: c.actor_username,
+    avatar: c.actor_avatar || undefined,
+    color: COMMENT_COLORS[c.id % COMMENT_COLORS.length],
+    time: formatTime(c.created_at),
+    content: c.content,
+    likes: 0,
+    replies: [],
+  };
 }
 
 function toSocialPost(p: ApiPost): SocialPost {
@@ -75,6 +149,27 @@ export default function OtherSpacePage() {
   const [userPosts, setUserPosts] = useState<SocialPost[]>([]);
   // 真实统计：粉丝 = 小基数 + 关注 +1；获赞 = 基础值 + 帖子点赞总和
   const [stats, setStats] = useState<UserStats>({ fans: 0, likes: 0, postCount: 0 });
+
+  // ===== 点赞 / 评论 / 图片放大 =====
+  const [likedIds, setLikedIds] = useState<Set<string>>(new Set());
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 评论抽屉
+  const [drawerPost, setDrawerPost] = useState<SocialPost | null>(null);
+  const [comments, setComments] = useState<CommentItem[]>([]);
+  const [commentsLoading, setCommentsLoading] = useState(false);
+  const [likedComments, setLikedComments] = useState<Record<string, boolean>>({});
+  // 每条动态的真实评论数（真实用户帖从后端 comment_count 初始化）
+  const [commentCounts, setCommentCounts] = useState<Record<string, number>>({});
+  // 图片放大浏览：当前打开的图片列表与索引
+  const [preview, setPreview] = useState<{ urls: string[]; index: number } | null>(null);
+
+  // 屏幕居中玻璃态 Toast，2 秒后自动消失
+  const showToast = (msg: string) => {
+    setToastMsg(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
+  };
 
   useEffect(() => {
     // 从 URL 提取 id：/space/u1（假数据）或 /space/3（真实数据库用户）
@@ -118,6 +213,23 @@ export default function OtherSpacePage() {
         const mine = all
           .filter((p) => p.author_id === Number(id))
           .map(toSocialPost);
+        // 每条动态的真实评论数（db-{id} → count）
+        const counts: Record<string, number> = {};
+        for (const p of all) counts[`db-${p.id}`] = p.comment_count ?? 0;
+        setCommentCounts(counts);
+        // 我赞过的动态 → 红心初始状态
+        const token = getToken();
+        if (token) {
+          fetch(`${API_BASE}/api/posts/liked`, {
+            headers: { Authorization: `Bearer ${token}` },
+          })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d) => {
+              if (cancelled || !d?.post_ids) return;
+              setLikedIds(new Set(d.post_ids.map((n: number) => `db-${n}`)));
+            })
+            .catch(() => {});
+        }
         setUser({
           id,
           name: profile.username,
@@ -160,6 +272,146 @@ export default function OtherSpacePage() {
     }));
   };
 
+  // ===== 点赞：已赞 → 再次点击取消红心（后端切换接口）；本地假数据帖子仅本地切换 =====
+  const toggleLike = async (post: SocialPost) => {
+    const token = getToken();
+    if (!token) {
+      showToast("请先登录后再点赞");
+      return;
+    }
+    const liked = likedIds.has(post.id);
+    if (!post.id.startsWith("db-")) {
+      setLikedIds((prev) => {
+        const s = new Set(prev);
+        if (liked) s.delete(post.id);
+        else s.add(post.id);
+        return s;
+      });
+      setUserPosts((prev) =>
+        prev.map((p) =>
+          p.id === post.id ? { ...p, likes: p.likes + (liked ? -1 : 1) } : p
+        )
+      );
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/posts/${post.id.slice(3)}/like`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        showToast(data?.detail ?? "点赞失败");
+        return;
+      }
+      const nowLiked = !!data.liked;
+      setLikedIds((prev) => {
+        const s = new Set(prev);
+        if (nowLiked) s.add(post.id);
+        else s.delete(post.id);
+        return s;
+      });
+      setUserPosts((prev) =>
+        prev.map((p) =>
+          p.id === post.id ? { ...p, likes: data.likes ?? p.likes } : p
+        )
+      );
+      setStats((prev) => ({
+        ...prev,
+        likes: prev.likes + (nowLiked ? 1 : -1),
+      }));
+      showToast(data.message ?? (nowLiked ? "点赞成功" : "已取消点赞"));
+    } catch {
+      showToast("无法连接服务器");
+    }
+  };
+
+  // ===== 评论抽屉：真实帖子拉后端评论，本地帖子读 localStorage =====
+  const openComments = (post: SocialPost) => {
+    setDrawerPost(post);
+    if (!post.id.startsWith("db-")) {
+      setComments(loadLocalComments(post.id));
+      return;
+    }
+    setComments([]);
+    setCommentsLoading(true);
+    fetch(`${API_BASE}/api/posts/${post.id.slice(3)}/comments`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then((list: ApiComment[]) => setComments(list.map(apiCommentToItem)))
+      .catch(() => {})
+      .finally(() => setCommentsLoading(false));
+  };
+
+  // ===== 发布评论：真实帖子 POST 后端（成功插入列表最前）；本地帖子存 localStorage =====
+  const handlePublish = async (content: string): Promise<boolean> => {
+    if (!drawerPost) return false;
+    const text = content.trim();
+    if (!text) return false;
+    const token = getToken();
+    if (!token) {
+      showToast("请先登录后再评论");
+      return false;
+    }
+    if (!drawerPost.id.startsWith("db-")) {
+      const me = getAuth();
+      const item: CommentItem = {
+        id: `local-${Date.now()}`,
+        author: me.username || ME_DEFAULT_NAME,
+        color: COMMENT_COLORS[0],
+        time: "刚刚",
+        content: text,
+        likes: 0,
+        replies: [],
+      };
+      const list = [item, ...loadLocalComments(drawerPost.id)];
+      saveLocalComments(drawerPost.id, list);
+      setComments(list);
+      setCommentCounts((prev) => ({
+        ...prev,
+        [drawerPost.id]: (prev[drawerPost.id] ?? 0) + 1,
+      }));
+      return true;
+    }
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/posts/${drawerPost.id.slice(3)}/comments`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ content: text }),
+        }
+      );
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        showToast(data?.detail ?? "评论失败");
+        return false;
+      }
+      const n = data.notification;
+      setComments((prev) => [
+        apiCommentToItem({
+          id: n.id,
+          actor_id: n.actor_id,
+          actor_username: n.actor_username,
+          actor_avatar: n.actor_avatar,
+          content: text,
+          created_at: new Date().toISOString(),
+        }),
+        ...prev,
+      ]);
+      setCommentCounts((prev) => ({
+        ...prev,
+        [drawerPost.id]: (prev[drawerPost.id] ?? 0) + 1,
+      }));
+      return true;
+    } catch {
+      showToast("无法连接服务器");
+      return false;
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-white text-sm text-zinc-400">
@@ -192,7 +444,7 @@ export default function OtherSpacePage() {
           src={user.banner}
           alt={`${user.name}的背景`}
           onError={(e) => {
-            (e.target as HTMLImageElement).src = "https://picsum.photos/800/400";
+            (e.target as HTMLImageElement).src = ME_DEFAULT_BANNER;
           }}
           className="h-full w-full object-cover"
         />
@@ -215,7 +467,7 @@ export default function OtherSpacePage() {
             src={user.avatar}
             alt={`${user.name}的头像`}
             onError={(e) => {
-              (e.target as HTMLImageElement).src = "https://picsum.photos/200";
+              (e.target as HTMLImageElement).src = ME_DEFAULT_AVATAR;
             }}
             className="absolute -top-16 left-6 h-32 w-32 rounded-full object-cover shadow-xl ring-4 ring-white"
           />
@@ -224,13 +476,14 @@ export default function OtherSpacePage() {
           <div className="flex items-start pl-44 pr-6 pt-8">
             <div className="min-w-0 flex-1">
               <p className="text-2xl font-bold text-zinc-900">{user.name}</p>
-              {/* 粉丝 / 动态 / 获赞：换排显示，真实数据推导 */}
+              {/* 粉丝 / 动态 / 获赞：各占一行分段显示 */}
               <p className="mt-2 text-sm text-zinc-500">
                 {formatFans(stats.fans)} 粉丝
               </p>
               <p className="mt-1 text-sm text-zinc-500">
-                {stats.postCount} 动态 · 获赞 {stats.likes}
+                {stats.postCount} 动态
               </p>
+              <p className="mt-1 text-sm text-zinc-500">获赞 {stats.likes}</p>
             </div>
             <button
               type="button"
@@ -308,16 +561,42 @@ export default function OtherSpacePage() {
                     post.images.length > 1 ? "grid-cols-2" : "grid-cols-1"
                   }`}
                 >
-                  {post.images.map((src) => (
+                  {post.images.map((src, i) => (
                     <img
                       key={src}
                       src={src}
                       alt="动态配图"
-                      className="max-h-80 w-full rounded-xl object-cover"
+                      onClick={() => setPreview({ urls: post.images, index: i })}
+                      className="max-h-80 w-full cursor-zoom-in rounded-xl object-cover transition-opacity hover:opacity-90"
                     />
                   ))}
                 </div>
               )}
+              {/* 底部操作栏：点赞（红心可切换）+ 评论 */}
+              <div className="mt-3 flex items-center gap-6 border-t border-white/60 pt-3 text-sm text-zinc-700">
+                <button
+                  type="button"
+                  aria-label="点赞"
+                  onClick={() => toggleLike(post)}
+                  className="flex items-center gap-1.5 transition-transform active:scale-75"
+                >
+                  <Heart
+                    className={`h-4 w-4 transition-colors ${
+                      likedIds.has(post.id) ? "fill-red-500 text-red-500" : ""
+                    }`}
+                  />
+                  {post.likes}
+                </button>
+                <button
+                  type="button"
+                  aria-label="评论"
+                  onClick={() => openComments(post)}
+                  className="flex items-center gap-1.5"
+                >
+                  <MessageCircle className="h-4 w-4" />
+                  {commentCounts[post.id] ?? 0}
+                </button>
+              </div>
             </div>
           ))}
           {userPosts.length === 0 && (
@@ -327,6 +606,87 @@ export default function OtherSpacePage() {
           )}
         </div>
       </div>
+
+      {/* ===== 评论抽屉（全站复用） ===== */}
+      {drawerPost && (
+        <CommentDrawer
+          open
+          onClose={() => setDrawerPost(null)}
+          post={{ title: displayTitle(drawerPost), author: drawerPost.author }}
+          comments={comments}
+          loading={commentsLoading}
+          likedComments={likedComments}
+          onToggleLike={(id) =>
+            setLikedComments((prev) => ({ ...prev, [id]: !prev[id] }))
+          }
+          onPublish={handlePublish}
+        />
+      )}
+
+      {/* ===== 图片放大浏览：全屏遮罩，多图左右切换，点遮罩/关闭键退出 ===== */}
+      {preview && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/90"
+          onClick={() => setPreview(null)}
+        >
+          <button
+            type="button"
+            aria-label="关闭放大预览"
+            onClick={() => setPreview(null)}
+            className="absolute right-4 top-4 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md transition-colors hover:bg-white/20"
+          >
+            <X className="h-5 w-5" />
+          </button>
+          <img
+            src={preview.urls[preview.index]}
+            alt="图片放大预览"
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[85vh] max-w-full object-contain"
+          />
+          {preview.urls.length > 1 && (
+            <>
+              <button
+                type="button"
+                aria-label="上一张"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPreview((p) =>
+                    p
+                      ? { ...p, index: (p.index - 1 + p.urls.length) % p.urls.length }
+                      : p
+                  );
+                }}
+                className="absolute left-3 flex h-11 w-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md transition-colors hover:bg-white/20"
+              >
+                <ChevronLeft className="h-5 w-5" />
+              </button>
+              <button
+                type="button"
+                aria-label="下一张"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPreview((p) =>
+                    p ? { ...p, index: (p.index + 1) % p.urls.length } : p
+                  );
+                }}
+                className="absolute right-3 flex h-11 w-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md transition-colors hover:bg-white/20"
+              >
+                <ChevronRight className="h-5 w-5" />
+              </button>
+              <span className="absolute bottom-6 left-1/2 -translate-x-1/2 rounded-full bg-black/50 px-3 py-1 text-xs text-white">
+                {preview.index + 1}/{preview.urls.length}
+              </span>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ===== 屏幕居中玻璃态 Toast ===== */}
+      {toastMsg && (
+        <div className="fixed left-1/2 top-1/2 z-[120] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-white/20 bg-black/60 px-6 py-3 text-white backdrop-blur-xl">
+          {toastMsg}
+        </div>
+      )}
     </div>
   );
 }

@@ -137,6 +137,8 @@ function FeedView({
 }) {
   const router = useRouter();
   const [liked, setLiked] = useState(false);
+  // 点赞数显示：跟随后端返回实时更新（红心可切换，二次点击取消）
+  const [likeCount, setLikeCount] = useState(post.likes);
   // Toast 消息内容：点赞/评论的成功与错误提示都走这里（此前文案被硬编码成"未登录"，导致点赞成功也误报）
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [carouselPage, setCarouselPage] = useState(0);
@@ -147,6 +149,24 @@ function FeedView({
   useEffect(() => {
     setFollowing(loadFollowIds().includes(post.authorId));
   }, [post.authorId]);
+
+  // 切换文章时重置红心，并按后端「我赞过的动态」恢复红心初始状态
+  useEffect(() => {
+    setLiked(false);
+    setLikeCount(post.likes);
+    const token = getToken();
+    if (!token || !post.id.startsWith("db-")) return;
+    fetch(`${API_BASE}/api/posts/liked`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.post_ids?.includes(Number(post.id.replace("db-", "")))) {
+          setLiked(true);
+        }
+      })
+      .catch(() => {});
+  }, [post.id]);
 
   // 关注/取关：更新 localStorage + React state 实时联动粉丝数
   const toggleFollow = () => {
@@ -192,31 +212,26 @@ function FeedView({
     toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
   };
 
-  // 核心交互：点赞 → 调后端 POST /api/posts/{id}/like（真实 +1 并给作者产生通知）
+  // 核心交互：点赞/取消点赞（切换红心）→ 调后端 POST /api/posts/{id}/like
   const handleLike = async () => {
-    if (!getToken()) {
-      showToast("未登录");
-      return;
-    }
-    if (liked) {
-      showToast("已经赞过这条动态了");
+    const token = getToken();
+    if (!token) {
+      showToast("请先登录后再点赞");
       return;
     }
     try {
       const res = await fetch(
         `${API_BASE}/api/posts/${post.id.replace("db-", "")}/like`,
-        {
-          method: "POST",
-          headers: { Authorization: `Bearer ${getToken()}` },
-        }
+        { method: "POST", headers: { Authorization: `Bearer ${token}` } }
       );
       const data = await res.json().catch(() => null);
       if (!res.ok) {
         showToast(data?.detail ?? "点赞失败");
         return;
       }
-      setLiked(true);
-      showToast("点赞成功");
+      setLiked(!!data.liked);
+      if (typeof data.likes === "number") setLikeCount(data.likes);
+      showToast(data.message ?? (data.liked ? "点赞成功" : "已取消点赞"));
     } catch (err) {
       console.error("[广场] 点赞失败：", err);
       showToast("无法连接服务器");
@@ -477,7 +492,7 @@ function FeedView({
                       liked ? "fill-red-500 text-red-500" : ""
                     }`}
                   />
-                  {post.likes + (liked ? 1 : 0)}
+                  {likeCount}
                 </button>
                 <button
                   type="button"
