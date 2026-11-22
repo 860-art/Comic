@@ -110,6 +110,19 @@ export default function ComicReadPage({
   // 每页独立的翻译状态：idle 未翻译 / loading 翻译中 / success 已翻译（流式渲染，互不阻塞）
   type PageTranslateStatus = "idle" | "loading" | "success" | "error";
   const [pageStatus, setPageStatus] = useState<Record<number, PageTranslateStatus>>({});
+  // 是否仍有页面在翻译中（普通变量，供顶部 hook 与后续逻辑共用）
+  const anyLoading = Object.values(pageStatus).some((s) => s === "loading");
+  // 每页翻译开始时间（毫秒时间戳）：用于「翻译超过 2 分钟」的卡死判定
+  const pageStartRef = useRef<Record<number, number>>({});
+  // 滴答时钟：仅存在翻译中的页面时每 10 秒触发一次重渲染，驱动超时按钮出现
+  const [nowTick, setNowTick] = useState(0);
+  // 注意：所有 Hook 必须放在组件顶部、任何提前 return 之前，
+  // 否则加载中/加载完成两次渲染的 Hook 数量不一致会导致页面直接崩溃
+  useEffect(() => {
+    if (!anyLoading) return;
+    const timer = setInterval(() => setNowTick(Date.now()), 10000);
+    return () => clearInterval(timer);
+  }, [anyLoading]);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   // 翻译抽屉内的设置：翻译方式 Tab / 图片文字识别开关 / 识别质量滑动条
   const [translateTab, setTranslateTab] = useState<"online" | "ai">("online");
@@ -260,22 +273,11 @@ export default function ComicReadPage({
   };
 
   // ===== 流式翻译：每页独立请求、独立渲染，先返回的页面先显示中文气泡 =====
-  const anyLoading = Object.values(pageStatus).some((s) => s === "loading");
   // 成功页里：有真实气泡 → 「已汉化」；全是空数组 → 「未识别到文字」
   const successEntries = Object.entries(pageStatus).filter(([, s]) => s === "success");
   const hasAnyBubbles = successEntries.some(([i]) => (translations[Number(i)] ?? []).length > 0);
   const hasEmptyPage = successEntries.some(([i]) => (translations[Number(i)] ?? []).length === 0);
   const hasTranslation = Object.keys(translations).length > 0;
-
-  // 每页翻译开始时间（毫秒时间戳）：用于「翻译超过 2 分钟」的卡死判定
-  const pageStartRef = useRef<Record<number, number>>({});
-  // 滴答时钟：仅存在翻译中的页面时每 10 秒触发一次重渲染，驱动超时按钮出现
-  const [nowTick, setNowTick] = useState(0);
-  useEffect(() => {
-    if (!anyLoading) return;
-    const timer = setInterval(() => setNowTick(Date.now()), 10000);
-    return () => clearInterval(timer);
-  }, [anyLoading]);
 
   /** 单页翻译请求：force=true 时让后端清掉该页旧缓存重跑；失败标记 error 而不是静默回 idle */
   const translateOnePage = async (
