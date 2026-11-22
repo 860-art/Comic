@@ -123,12 +123,23 @@ class Post(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     content: Mapped[str | None] = mapped_column(Text)
     image_url: Mapped[str | None] = mapped_column(Text)
+    # 多图：JSON 数组字符串（如 '["u1","u2"]'）；旧数据为空时由序列化层回退 image_url
+    image_urls: Mapped[str | None] = mapped_column(Text)
+    # 被 @ 的用户 ID（当前版本仅允许 @ 管理员）；正文后显示紫色 @ 徽标并触发 mention 通知
+    mention_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), index=True
+    )
     author_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     # 点赞计数：收到赞时 +1（防重复由 notifications 表的 like 记录保证）
     likes: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # relationship：post.author.username 直接拿到作者用户名
-    author: Mapped["User"] = relationship("User")
+    # （posts→users 有 author_id / mention_user_id 两条外键路径，两边都必须显式指定）
+    author: Mapped["User"] = relationship("User", foreign_keys=[author_id])
+    # 被 @ 的用户（与 author 是同一张表的两个外键，必须显式指定 foreign_keys）
+    mention_user: Mapped["User | None"] = relationship(
+        "User", foreign_keys=[mention_user_id]
+    )
 
 
 # ===== 待审核投稿表：用户投稿 → 管理员审核 → 正式 Comic =====
@@ -183,7 +194,12 @@ class ProfileUpdate(BaseModel):
 class CreatePostRequest(BaseModel):
     """发帖请求：文字与图片至少一项。"""
     content: str | None = None
+    # 旧版单图字段：保留兼容旧客户端；新版一律传 images 数组
     image_url: str | None = None
+    # 多图（最多 9 张，R2 公网 URL 列表）
+    images: list[str] = []
+    # @ 的用户名：当前版本仅支持 @ 管理员账号（AO）
+    mention: str | None = None
 
 
 class ChapterInput(BaseModel):
@@ -321,12 +337,16 @@ if _inspector.has_table("pending_comics"):
             if _col_name not in _pc_cols:
                 _conn.execute(text(_ddl))
 
-# 旧版 posts 表缺 likes 列时自动补列
+# 旧版 posts 表缺 likes / image_urls / mention_user_id 列时自动补列
 if _inspector.has_table("posts"):
     _post_cols = {col["name"] for col in _inspector.get_columns("posts")}
     with engine.begin() as _conn:
         if "likes" not in _post_cols:
             _conn.execute(text("ALTER TABLE posts ADD COLUMN likes INTEGER DEFAULT 0"))
+        if "image_urls" not in _post_cols:
+            _conn.execute(text("ALTER TABLE posts ADD COLUMN image_urls TEXT"))
+        if "mention_user_id" not in _post_cols:
+            _conn.execute(text("ALTER TABLE posts ADD COLUMN mention_user_id INTEGER"))
 
 # 旧版 comics 表缺 submitter_id（投稿人）列时自动补列
 if _inspector.has_table("comics"):
@@ -519,6 +539,18 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
     return user
 
 
+def _post_image_urls(post: Post) -> list[str]:
+    """帖子全部配图 URL：优先 image_urls JSON 数组，旧数据回退单图 image_url。"""
+    if post.image_urls:
+        try:
+            arr = json.loads(post.image_urls)
+            if isinstance(arr, list) and arr:
+                return [str(u) for u in arr if u]
+        except Exception:
+            pass
+    return [post.image_url] if post.image_url else []
+
+
 def post_to_dict(post: Post) -> dict:
     """把 Post ORM 对象序列化为前端所需的 JSON（relationship 带出作者用户名）。
 
@@ -529,6 +561,8 @@ def post_to_dict(post: Post) -> dict:
         "id": post.id,
         "content": post.content,
         "image_url": post.image_url,
+        "image_urls": _post_image_urls(post),
+        "mention_username": post.mention_user.username if post.mention_user else None,
         "author_id": post.author_id,
         "author_username": post.author.username,
         "likes": post.likes,
@@ -1487,15 +1521,55 @@ def create_post(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """发帖：从 Token 解析当前用户作为作者，写入 posts 表。"""
+    """发帖：从 Token 解析当前用户作为作者，写入 posts 表。
+
+    - 图片支持多张（最多 9 张）：images 数组优先，旧字段 image_url 兼容为单图
+    - mention 可选 @ 管理员：正文后显示紫色 @ 徽标，并给被 @ 者写 mention 通知
+      （通知中心点击 → /square?post_id= 精准定位该动态）
+    """
     content = (req.content or "").strip()
-    if not content and not req.image_url:
+    image_urls = [u.strip() for u in (req.images or []) if u and u.strip()]
+    if not image_urls and req.image_url:
+        image_urls = [req.image_url]
+    if len(image_urls) > 9:
+        raise HTTPException(status_code=400, detail="最多上传 9 张图片")
+    if not content and not image_urls:
         raise HTTPException(status_code=400, detail="文字内容和图片至少要有一样")
 
-    post = Post(content=content or None, image_url=req.image_url, author_id=user.id)
+    # @ 好友：当前版本仅允许 @ 管理员账号（防止用户随便 @ 别人造成骚扰）
+    mention_user = None
+    mention_name = (req.mention or "").strip().lstrip("@")
+    if mention_name:
+        mention_user = (
+            db.query(User).filter(User.username == mention_name).first()
+        )
+        if mention_user is None or mention_user.role != "admin":
+            raise HTTPException(status_code=400, detail="只能 @ 管理员账号")
+
+    post = Post(
+        content=content or None,
+        image_url=image_urls[0] if image_urls else None,
+        image_urls=json.dumps(image_urls, ensure_ascii=False) if image_urls else None,
+        mention_user_id=mention_user.id if mention_user else None,
+        author_id=user.id,
+    )
     db.add(post)
     db.commit()
     db.refresh(post)
+
+    # mention 通知：给被 @ 的管理员写一条（@ 自己不通知）
+    if mention_user is not None and mention_user.id != user.id:
+        db.add(
+            Notification(
+                type="mention",
+                actor_id=user.id,
+                recipient_id=mention_user.id,
+                post_id=post.id,
+                content=f"{user.username} 在动态中提到了你",
+            )
+        )
+        db.commit()
+
     return {"message": "发布成功", "post": post_to_dict(post)}
 
 

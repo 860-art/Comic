@@ -3,7 +3,7 @@
 
 import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { ChevronDown, ChevronUp, Flame, Heart, MessageCircle } from "lucide-react";
+import { AtSign, ChevronDown, ChevronUp, Flame, Heart, MessageCircle } from "lucide-react";
 import CommentDrawer, { type CommentItem } from "@/components/CommentDrawer";
 import {
   ME_ID,
@@ -36,6 +36,8 @@ interface ApiPost {
   id: number;
   content: string | null;
   image_url: string | null;
+  image_urls?: string[] | null;
+  mention_username?: string | null;
   author_id: number;
   author_username: string;
   likes: number;
@@ -51,7 +53,13 @@ function toSocialPost(p: ApiPost): SocialPost {
     author: p.author_username,
     followers: 0,
     tags: [],
-    images: p.image_url ? [p.image_url] : [],
+    images:
+      p.image_urls && p.image_urls.length > 0
+        ? p.image_urls
+        : p.image_url
+          ? [p.image_url]
+          : [],
+    mention: p.mention_username ?? undefined,
     likes: p.likes ?? 0,
     comments: [],
     commentsCount: 0,
@@ -483,6 +491,14 @@ function FeedView({
               <p className="mt-4 whitespace-pre-line text-sm leading-relaxed text-gray-700">
                 {post.intro}
               </p>
+
+              {/* @ 徽标：正文后紫色提示（点击@通知跳转进来的定位已由 post_id 处理） */}
+              {post.mention && (
+                <span className="mt-3 inline-flex items-center gap-0.5 rounded-full bg-violet-100 px-2.5 py-0.5 text-xs font-medium text-violet-600">
+                  <AtSign className="h-3 w-3" />
+                  {post.mention}
+                </span>
+              )}
 
               {/* 文章结尾：点赞 / 评论计数 */}
               <div className="mt-6 flex items-center gap-6 border-t border-white/60 pt-4 text-sm text-gray-700">

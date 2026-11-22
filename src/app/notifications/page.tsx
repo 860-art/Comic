@@ -35,7 +35,7 @@ interface ApiNotification {
   /** 来源：私人通知 / 全站公告 */
   source: "notification" | "announcement";
   id: number;
-  type: "like" | "comment" | "review" | "official";
+  type: "like" | "comment" | "review" | "mention" | "official";
   title: string | null;
   actor_id: number;
   actor_username: string;
@@ -49,7 +49,7 @@ interface ApiNotification {
 
 /** 合并后的统一渲染条目：kind 区分官方公告与互动/审核通知 */
 interface UnifiedItem {
-  kind: "official" | "like" | "comment" | "review";
+  kind: "official" | "like" | "comment" | "review" | "mention";
   /** 唯一渲染 key：ann-{id} / noti-{id} */
   id: string;
   /** 数据来源（删除时决定调用公告接口还是通知接口） */
@@ -383,7 +383,9 @@ export default function NotificationsPage() {
                           <span className="text-zinc-700">
                             {item.kind === "like"
                               ? " 赞了你的动态"
-                              : " 评论了你："}
+                              : item.kind === "mention"
+                                ? " 在动态中提到了你"
+                                : " 评论了你："}
                           </span>
                         </p>
                       )}

@@ -31,6 +31,8 @@ export interface SocialPost {
   comments: CommentItem[];
   /** 评论数（与 comments.length 保持同步） */
   commentsCount: number;
+  /** 被 @ 的用户名（当前版本仅管理员）；正文后显示紫色 @ 徽标 */
+  mention?: string;
 }
 
 export interface SpaceUser {

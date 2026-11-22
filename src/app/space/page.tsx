@@ -36,9 +36,17 @@ interface ApiPost {
   id: number;
   content: string | null;
   image_url: string | null;
+  image_urls?: string[] | null;
+  mention_username?: string | null;
   author_id: number;
   author_username: string;
   created_at: string;
+}
+
+/** 帖子全部配图：image_urls 多图优先，旧单图数据回退 image_url */
+function postImages(p: ApiPost): string[] {
+  if (p.image_urls && p.image_urls.length > 0) return p.image_urls;
+  return p.image_url ? [p.image_url] : [];
 }
 
 export default function SpacePage() {
@@ -58,6 +66,9 @@ export default function SpacePage() {
   const [composerOpen, setComposerOpen] = useState(false);
   const [content, setContent] = useState("");
   const [images, setImages] = useState<string[]>([]);
+  const [uploading, setUploading] = useState(false);
+  // @ 好友：当前版本仅支持 @ 管理员（AO），选中后正文后显示紫色徽标并通知对方
+  const [mention, setMention] = useState<string | null>(null);
   const [publishing, setPublishing] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -132,15 +143,30 @@ export default function SpacePage() {
     else if (!loggedIn) setLoading(false);
   }, [myId, loggedIn, loadPosts]);
 
-  // 本地选图：上传到 R2 对象存储，公网 URL 作为 image_url 提交入库
+  // 本地选图（支持多选）：逐张上传到 R2，公网 URL 追加到 images（上限 9 张）
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const files = Array.from(e.target.files ?? []);
     e.target.value = "";
-    if (!file) return;
+    if (files.length === 0) return;
+    const room = 9 - images.length;
+    if (room <= 0) {
+      showToast("最多上传 9 张图片");
+      return;
+    }
+    if (files.length > room) {
+      showToast(`最多 9 张，已只保留前 ${room} 张`);
+    }
+    setUploading(true);
     try {
-      setImages([await uploadImage(file)]);
+      const urls: string[] = [];
+      for (const file of files.slice(0, room)) {
+        urls.push(await uploadImage(file));
+      }
+      setImages((prev) => [...prev, ...urls]);
     } catch (err) {
       showToast(err instanceof Error ? err.message : "图片上传失败");
+    } finally {
+      setUploading(false);
     }
   };
 
@@ -160,8 +186,8 @@ export default function SpacePage() {
 
   // 发布：带 Bearer token POST /api/posts → 成功后重新拉取列表
   const handlePublish = async () => {
-    if (images.length === 0) {
-      showToast("请至少上传一张图片");
+    if (!content.trim() && images.length === 0) {
+      showToast("写点文字或上传图片吧");
       return;
     }
     const token = getToken();
@@ -179,7 +205,9 @@ export default function SpacePage() {
         },
         body: JSON.stringify({
           content: content.trim() || null,
-          image_url: images[0],
+          image_url: images[0] ?? null,
+          images,
+          mention,
         }),
       });
       if (!res.ok) {
@@ -190,6 +218,7 @@ export default function SpacePage() {
       // 成功：清空表单 + 关闭抽屉 + 重新拉取当前页面的帖子列表
       setContent("");
       setImages([]);
+      setMention(null);
       setSelectedTags([]);
       setComposerOpen(false);
       showToast("发布成功");
@@ -357,14 +386,39 @@ export default function SpacePage() {
                     {post.content}
                   </p>
                 )}
-                {/* 配图 */}
-                {post.image_url && (
-                  <img
-                    src={post.image_url}
-                    alt="动态配图"
-                    className="mt-3 max-h-80 w-full rounded-xl object-cover"
-                  />
+                {/* @ 徽标（正文后，紫色提示） */}
+                {post.mention_username && (
+                  <span className="mt-2 inline-flex items-center gap-0.5 rounded-full bg-violet-100 px-2.5 py-0.5 text-xs font-medium text-violet-600">
+                    <AtSign className="h-3 w-3" />
+                    {post.mention_username}
+                  </span>
                 )}
+                {/* 配图：单张全宽，多张三列网格 */}
+                {(() => {
+                  const urls = postImages(post);
+                  if (urls.length === 0) return null;
+                  if (urls.length === 1) {
+                    return (
+                      <img
+                        src={urls[0]}
+                        alt="动态配图"
+                        className="mt-3 max-h-80 w-full rounded-xl object-cover"
+                      />
+                    );
+                  }
+                  return (
+                    <div className="mt-3 grid grid-cols-3 gap-2">
+                      {urls.map((u) => (
+                        <img
+                          key={u}
+                          src={u}
+                          alt="动态配图"
+                          className="aspect-square w-full rounded-lg object-cover"
+                        />
+                      ))}
+                    </div>
+                  );
+                })()}
               </div>
             ))}
           {!loading && posts.length === 0 && (
@@ -446,7 +500,7 @@ export default function SpacePage() {
                   ))}
                 </div>
               )}
-              {/* 配图预览（单张）+ 添加图片占位框 */}
+              {/* 配图预览（多张，可单张移除）+ 添加图片占位框（满 9 张隐藏） */}
               <div className="mt-3 flex flex-wrap gap-3">
                 {images.map((src, i) => (
                   <div key={i} className="relative">
@@ -457,15 +511,17 @@ export default function SpacePage() {
                     />
                     <button
                       type="button"
-                      aria-label="移除配图"
-                      onClick={() => setImages([])}
+                      aria-label={`移除第 ${i + 1} 张配图`}
+                      onClick={() =>
+                        setImages((prev) => prev.filter((_, j) => j !== i))
+                      }
                       className="absolute -right-2 -top-2 flex h-6 w-6 items-center justify-center rounded-full bg-zinc-900/80 text-white"
                     >
                       <X className="h-3.5 w-3.5" />
                     </button>
                   </div>
                 ))}
-                {images.length === 0 && (
+                {images.length < 9 && (
                   <button
                     type="button"
                     aria-label="添加图片"
@@ -473,15 +529,36 @@ export default function SpacePage() {
                     className="flex h-24 w-24 flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-zinc-300 bg-zinc-100/80 text-zinc-400 transition-colors hover:bg-zinc-200/70"
                   >
                     <ImagePlus className="h-6 w-6" />
-                    <span className="text-xs">添加图片</span>
+                    <span className="text-xs">
+                      {uploading ? "上传中..." : "添加图片"}
+                    </span>
                   </button>
                 )}
               </div>
-              <div className="mt-4 flex flex-wrap gap-2">
-                <span className="flex items-center gap-1 rounded-full bg-zinc-100 px-3 py-1.5 text-xs text-zinc-500">
-                  <AtSign className="h-3 w-3" />
-                  好友
-                </span>
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                {mention ? (
+                  <span className="flex items-center gap-1 rounded-full bg-violet-100 px-3 py-1.5 text-xs font-medium text-violet-600">
+                    <AtSign className="h-3 w-3" />
+                    {mention}
+                    <button
+                      type="button"
+                      aria-label="移除 @"
+                      onClick={() => setMention(null)}
+                      className="flex h-4 w-4 items-center justify-center rounded-full bg-violet-200 text-violet-600 hover:bg-violet-300"
+                    >
+                      <X className="h-2.5 w-2.5" />
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setMention("AO")}
+                    className="flex items-center gap-1 rounded-full bg-zinc-100 px-3 py-1.5 text-xs text-zinc-500 transition-colors hover:bg-zinc-200/70"
+                  >
+                    <AtSign className="h-3 w-3" />
+                    好友
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setTagPickerOpen(true)}
@@ -627,6 +704,7 @@ export default function SpacePage() {
         ref={fileInputRef}
         type="file"
         accept="image/*"
+        multiple
         className="hidden"
         onChange={handleFile}
       />
