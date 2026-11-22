@@ -24,7 +24,6 @@ import { getToken } from "@/lib/auth";
  *   无 post_id → 全部随机打乱（每次刷新顺序都不同）
  * - 页面外层固定高度，只渲染 posts[activeIndex] 这一篇文章，绝不用 map 渲染多篇
  * - 左侧悬浮玻璃态上/下箭头切换文章，超出范围置灰禁用
- * - 动态吸顶导航：初始显示“漫画广场”，文章主标题滑出屏幕后平滑变为当前文章标题（无页码显示）
  * - 文章内容区：作者信息区（头像/名字 + 粉丝数 + 关注按钮）、图片轮播、正文、点赞评论
  * - 点赞拦截：未登录弹出“未登录”玻璃态 Toast（2 秒自动消失）
  */
@@ -139,7 +138,6 @@ function FeedView({
   const router = useRouter();
   const [liked, setLiked] = useState(false);
   const [toast, setToast] = useState(false);
-  const [titleOutOfView, setTitleOutOfView] = useState(false);
   const [carouselPage, setCarouselPage] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
   // 关注状态：挂载时从 localStorage('follows') 恢复；粉丝数 = 基础数 + (已关注 ? 1 : 0)
@@ -175,7 +173,6 @@ function FeedView({
   const [likedComments, setLikedComments] = useState<Record<string, boolean>>({});
 
   const scrollRef = useRef<HTMLDivElement>(null);
-  const titleRef = useRef<HTMLHeadingElement>(null);
   const carouselRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -185,19 +182,6 @@ function FeedView({
       if (toastTimer.current) clearTimeout(toastTimer.current);
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
-  }, []);
-
-  // 动态吸顶：文章主标题滑出滚动容器后，吸顶栏文字平滑切换为当前文章标题
-  useEffect(() => {
-    const scrollEl = scrollRef.current;
-    const titleEl = titleRef.current;
-    if (!scrollEl || !titleEl) return;
-    const observer = new IntersectionObserver(
-      ([entry]) => setTitleOutOfView(!entry.isIntersecting),
-      { root: scrollEl, threshold: 0 }
-    );
-    observer.observe(titleEl);
-    return () => observer.disconnect();
   }, []);
 
   // 屏幕正中玻璃态 Toast，2 秒后自动消失
@@ -354,26 +338,6 @@ function FeedView({
 
       {/* 文章内容区：允许向下滚动阅读 */}
       <div ref={scrollRef} className="h-full overflow-y-auto">
-        {/* 动态吸顶导航：标题滑出屏幕后左侧文字平滑切换为文章标题 */}
-        <div className="sticky top-0 z-50 flex h-14 items-center border-b border-white/30 bg-white/50 px-4 backdrop-blur-xl">
-          <div className="relative h-6 min-w-0 flex-1 overflow-hidden">
-            <span
-              className={`absolute inset-0 flex items-center font-bold text-gray-900 transition-all duration-300 ${
-                titleOutOfView ? "-translate-y-6 opacity-0" : "translate-y-0 opacity-100"
-              }`}
-            >
-              漫画广场
-            </span>
-            <span
-              className={`absolute inset-0 flex items-center truncate font-bold text-gray-900 transition-all duration-300 ${
-                titleOutOfView ? "translate-y-0 opacity-100" : "translate-y-6 opacity-0"
-              }`}
-            >
-              {displayTitle(post)}
-            </span>
-          </div>
-        </div>
-
         {/* 单篇文章白毛玻璃卡片 */}
         <div className="mx-auto max-w-3xl px-4 py-6">
           <article className="overflow-hidden rounded-3xl border border-white/50 bg-white/60 shadow-[0_8px_32px_0_rgba(31,38,135,0.1)] backdrop-blur-2xl">
@@ -439,7 +403,7 @@ function FeedView({
             {/* 文字内容区：黑色/深灰文字，保证白玻璃上对比清晰 */}
             <div className="p-5">
               {/* 作者信息区：头像/名字可点击跳转空间；关注按钮与粉丝数联动 */}
-              <h1 ref={titleRef} className="text-3xl font-bold text-gray-900">
+              <h1 className="text-3xl font-bold text-gray-900">
                 {displayTitle(post)}
               </h1>
               <div className="mt-4 flex items-center gap-3">
