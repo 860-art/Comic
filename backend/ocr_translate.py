@@ -405,7 +405,33 @@ _TRANSLATE_PROMPT = (
     "人名、地名、拟声词、单字母、纯符号也要音译或意译成汉字"
     "（例如 SISTER DANA → 达娜修女，S- → 咝，AH! → 啊！），"
     "绝不要因为文本很短就原样返回；返回数组的元素个数必须与输入完全一致。"
+    "若台词里出现网址、域名或站点水印（如 XXX.ORG / XXX.COM / http 链接），"
+    "一律用中文描述或直接省略，严禁把拉丁字母原样写进译文。"
 )
+
+# ===== 水印/推广气泡过滤 =====
+# 漫画图上常带盗版站水印（如「MAKE SURE YOU ... CEAL MAGUSTOON.ORG」），
+# 它不是对白，模型又总会忠实保留域名拉丁字母，导致中文校验永远不过、整页翻译失败。
+# 这类文本在【翻译前】直接剔除：不送 LLM、不生成中文气泡，也不影响其它正常对白。
+_WATERMARK_RE = re.compile(
+    r"(?:https?://|www\.)\S+"  # 完整 URL
+    r"|\b[A-Za-z0-9][A-Za-z0-9\-]*\s*\.\s*"
+    r"(?:org|com|net|io|cc|co|xyz|top|site|club|shop|me|tv|info|biz|kr|jp|cn)\b"  # 域名，允许 "MAGUSTOON .ORG"
+    r"|\.\s*(?:org|com|net|io|cc|co|xyz|top|site|club|shop|me|tv|info|biz|kr|jp|cn)\b"  # 孤立后缀 " .ORG"
+    r"|\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",  # 邮箱
+    re.IGNORECASE,
+)
+
+
+def strip_watermark_items(items: list[dict]) -> list[dict]:
+    """剔除含网址/域名/邮箱的水印推广气泡（保留正常对白），并打印剔除数量便于排查。"""
+    if not items:
+        return items
+    kept = [it for it in items if not _WATERMARK_RE.search(str(it.get("text") or ""))]
+    removed = len(items) - len(kept)
+    if removed:
+        print(f"[watermark] 剔除 {removed} 个含网址/域名的水印气泡（不参与翻译）")
+    return kept
 
 # ===== 译文中文校验 =====
 # 大模型偶尔偷懒：数组里只有一部分翻成中文，其余原样返回英文/韩文/日文；
@@ -417,11 +443,18 @@ _FOREIGN_RE = re.compile(r"[A-Za-z]{3,}|[\uac00-\ud7af\u3130-\u318f]|[\u3040-\u3
 
 
 def _is_chinese_translation(text: str) -> bool:
-    """单条译文是否为合规中文：至少含一个汉字，且不含成串外文与伪翻译标记。"""
+    """单条译文是否为合规中文：至少含一个汉字，且不含成串外文与伪翻译标记。
+
+    网址/域名残留（水印）先剥离再判定：它不是「原文台词残留」；
+    纯外文句子、伪翻译标记仍一律拒绝，严格校验不放松。
+    """
     t = (text or "").strip()
+    if not t or "[译]" in t:
+        return False
+    t = _WATERMARK_RE.sub("", t).strip()
     if not t or not _CJK_RE.search(t):
         return False
-    if "[译]" in t or _FOREIGN_RE.search(t):
+    if _FOREIGN_RE.search(t):
         return False
     return True
 
@@ -947,6 +980,8 @@ async def translate_comic(request: Request):
 
     # 同气泡多行小框合并成大气泡框：整段话一次性发给 LLM，翻译出连贯中文
     items = _merge_bubble_lines(items)
+    # 剔除含网址/域名的水印推广气泡（不是对白，且会让中文校验永远失败）
+    items = strip_watermark_items(items)
 
     texts = [it["text"] for it in items]
     print(f"[translate] 最终发给大模型的文本({len(texts)} 条): {texts}")
@@ -1339,6 +1374,7 @@ def run_translation_task(task_id: int) -> None:
         items = _parse_ocr_result(raw)
         items = _filter_items(items, img)
         items = _merge_bubble_lines(items) if items else []
+        items = strip_watermark_items(items)  # 水印/网址气泡不参与翻译，避免整页被拖垮
 
         if not items:
             # 图片本身无文字（或本次 OCR 漏检）→ 空数组是合法完成态，
