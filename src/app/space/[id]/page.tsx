@@ -31,6 +31,7 @@ import {
 } from "@/data/posts";
 import { API_BASE } from "@/lib/api";
 import { getAuth, getToken } from "@/lib/auth";
+import { dataUrlToFile, uploadImage } from "@/lib/upload";
 import { formatTime } from "@/lib/time";
 
 /** 本地假数据帖子的评论存储（与广场页同 key，评论互通） */
@@ -90,6 +91,7 @@ interface ApiComment {
   actor_username: string;
   actor_avatar?: string | null;
   content: string;
+  image_url?: string | null;
   created_at: string;
 }
 
@@ -110,6 +112,7 @@ function apiCommentToItem(c: ApiComment): CommentItem {
     color: COMMENT_COLORS[c.id % COMMENT_COLORS.length],
     time: formatTime(c.created_at),
     content: c.content,
+    image: c.image_url || undefined,
     likes: 0,
     replies: [],
   };
@@ -342,15 +345,28 @@ export default function OtherSpacePage() {
       .finally(() => setCommentsLoading(false));
   };
 
-  // ===== 发布评论：真实帖子 POST 后端（成功插入列表最前）；本地帖子存 localStorage =====
-  const handlePublish = async (content: string): Promise<boolean> => {
+  // ===== 发布评论：真实帖子 POST 后端（成功插入列表最前）；本地帖子存 localStorage；带图先上传 R2 =====
+  const handlePublish = async (
+    content: string,
+    imageDataUrl?: string
+  ): Promise<boolean> => {
     if (!drawerPost) return false;
     const text = content.trim();
-    if (!text) return false;
+    if (!text && !imageDataUrl) return false;
     const token = getToken();
     if (!token) {
       showToast("请先登录后再评论");
       return false;
+    }
+    // 评论配图：先上传 R2 拿公网 URL
+    let imageUrl: string | undefined;
+    if (imageDataUrl) {
+      try {
+        imageUrl = await uploadImage(dataUrlToFile(imageDataUrl));
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : "图片上传失败");
+        return false;
+      }
     }
     if (!drawerPost.id.startsWith("db-")) {
       const me = getAuth();
@@ -360,6 +376,7 @@ export default function OtherSpacePage() {
         color: COMMENT_COLORS[0],
         time: "刚刚",
         content: text,
+        image: imageUrl,
         likes: 0,
         replies: [],
       };
@@ -381,7 +398,7 @@ export default function OtherSpacePage() {
             "Content-Type": "application/json",
             Authorization: `Bearer ${token}`,
           },
-          body: JSON.stringify({ content: text }),
+          body: JSON.stringify({ content: text, image_url: imageUrl ?? null }),
         }
       );
       const data = await res.json().catch(() => null);
@@ -397,6 +414,7 @@ export default function OtherSpacePage() {
           actor_username: n.actor_username,
           actor_avatar: n.actor_avatar,
           content: text,
+          image_url: n.image_url,
           created_at: new Date().toISOString(),
         }),
         ...prev,
@@ -481,9 +499,8 @@ export default function OtherSpacePage() {
                 {formatFans(stats.fans)} 粉丝
               </p>
               <p className="mt-1 text-sm text-zinc-500">
-                {stats.postCount} 动态
+                {stats.postCount} 动态 · 获赞 {stats.likes}
               </p>
-              <p className="mt-1 text-sm text-zinc-500">获赞 {stats.likes}</p>
             </div>
             <button
               type="button"

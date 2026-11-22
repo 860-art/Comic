@@ -367,6 +367,20 @@ if _inspector.has_table("pending_comics"):
         if "approved_comic_id" not in _pc_cols:
             _conn.execute(text("ALTER TABLE pending_comics ADD COLUMN approved_comic_id INTEGER"))
 
+# 旧版 notifications 表缺 image_url（评论附图）列时自动补列
+if _inspector.has_table("notifications"):
+    _noti_cols2 = {col["name"] for col in _inspector.get_columns("notifications")}
+    with engine.begin() as _conn:
+        if "image_url" not in _noti_cols2:
+            _conn.execute(text("ALTER TABLE notifications ADD COLUMN image_url TEXT"))
+
+# 旧版 comments（漫画评论）表缺 image_url（评论附图）列时自动补列
+if _inspector.has_table("comments"):
+    _comment_cols = {col["name"] for col in _inspector.get_columns("comments")}
+    with engine.begin() as _conn:
+        if "image_url" not in _comment_cols:
+            _conn.execute(text("ALTER TABLE comments ADD COLUMN image_url TEXT"))
+
 # 旧版 notifications 表：post_id 为 NOT NULL（审核通知不属于帖子，需要可空）→ 重建表；
 # 同时补 is_read（未读红点）。SQLite 不支持改列约束，只能建新表搬数据。
 if _inspector.has_table("notifications"):
@@ -713,6 +727,8 @@ class Comment(Base):
     content: Mapped[str] = mapped_column(Text)
     comic_id: Mapped[int] = mapped_column(ForeignKey("comics.id"), index=True)
     author_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # 评论附图（可选）：R2 公网 URL
+    image_url: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # relationship：评论.author.username / 评论.author.avatar_url 反查发评论人
     author: Mapped["User"] = relationship("User")
@@ -727,6 +743,7 @@ def comment_to_dict(c: Comment) -> dict:
         "author_id": c.author_id,
         "author_username": c.author.username,
         "avatar_url": c.author.avatar_url,
+        "image_url": c.image_url,
         "created_at": c.created_at.replace(tzinfo=timezone.utc).isoformat(),
     }
 
@@ -772,6 +789,8 @@ class Notification(Base):
     post_id: Mapped[int | None] = mapped_column(ForeignKey("posts.id"), index=True)
     # 评论内容 / 审核结果文案（like 类型为空）
     content: Mapped[str | None] = mapped_column(Text)
+    # 评论附图（comment 通知专用，like/review 为空）：R2 公网 URL
+    image_url: Mapped[str | None] = mapped_column(Text)
     # 是否已读：导航栏铃铛红点按未读数判断
     is_read: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -789,6 +808,7 @@ def notification_to_dict(n: Notification) -> dict:
         "recipient_id": n.recipient_id,
         "post_id": n.post_id,
         "content": n.content,
+        "image_url": n.image_url,
         "is_read": bool(n.is_read),
         "created_at": n.created_at.replace(tzinfo=timezone.utc).isoformat(),
     }
@@ -1127,11 +1147,12 @@ def create_comic_comment(
     if db.query(Comic).filter(Comic.id == comic_id).first() is None:
         raise HTTPException(status_code=404, detail="漫画不存在")
     content = (body.get("content") or "").strip()
-    if not content:
+    image_url = (body.get("image_url") or "").strip() or None
+    if not content and not image_url:
         raise HTTPException(status_code=400, detail="评论内容不能为空")
-    if len(content) > 500:
+    if content and len(content) > 500:
         raise HTTPException(status_code=400, detail="评论内容不能超过 500 字")
-    comment = Comment(content=content, comic_id=comic_id, author_id=user.id)
+    comment = Comment(content=content, comic_id=comic_id, author_id=user.id, image_url=image_url)
     db.add(comment)
     db.commit()
     db.refresh(comment)
@@ -1777,6 +1798,7 @@ def list_post_comments(
             "actor_username": n.actor.username,
             "actor_avatar": n.actor.avatar_url,
             "content": n.content,
+            "image_url": n.image_url,
             "created_at": n.created_at.replace(tzinfo=timezone.utc).isoformat(),
         }
         for n in rows
@@ -1784,8 +1806,9 @@ def list_post_comments(
 
 
 class PostCommentRequest(BaseModel):
-    """帖子评论请求：内容必填。"""
+    """帖子评论请求：内容必填；附图可选（已上传到 R2 的公网 URL）。"""
     content: str
+    image_url: str | None = None
 
 
 @app.post("/api/posts/{post_id}/comments")
@@ -1795,14 +1818,15 @@ def comment_post(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """评论动态：给作者产生 comment 通知（评论内容随通知存储）。"""
+    """评论动态：给作者产生 comment 通知（评论内容与附图随通知存储）。"""
     post = db.query(Post).filter(Post.id == post_id).first()
     if post is None:
         raise HTTPException(status_code=404, detail="帖子不存在")
     content = (req.content or "").strip()
-    if not content:
+    image_url = (req.image_url or "").strip() or None
+    if not content and not image_url:
         raise HTTPException(status_code=400, detail="评论内容不能为空")
-    if len(content) > 500:
+    if content and len(content) > 500:
         raise HTTPException(status_code=400, detail="评论内容不能超过 500 字")
     notification = Notification(
         type="comment",
@@ -1810,6 +1834,7 @@ def comment_post(
         recipient_id=post.author_id,
         post_id=post_id,
         content=content,
+        image_url=image_url,
     )
     db.add(notification)
     db.commit()

@@ -29,6 +29,7 @@ import { getToken } from "@/lib/auth";
  */
 
 import { API_BASE } from "@/lib/api";
+import { dataUrlToFile, uploadImage } from "@/lib/upload";
 
 /** 后端 GET /api/posts 返回的单条数据结构 */
 interface ApiPost {
@@ -243,16 +244,28 @@ function FeedView({
     setLikedComments((prev) => ({ ...prev, [id]: !prev[id] }));
 
   // 发布评论：调后端 POST /api/posts/{id}/comments（给作者产生真实评论通知），
-  // 成功后用后端返回的真实身份插入列表最前面
-  const handlePublish = async (content: string): Promise<boolean> => {
+  // 成功后用后端返回的真实身份插入列表最前面；带图时先上传 R2 再随评论入库
+  const handlePublish = async (
+    content: string,
+    imageDataUrl?: string
+  ): Promise<boolean> => {
     const token = getToken();
     if (!token) {
-      showToast("未登录");
+      showToast("请先登录后再评论");
       return false;
     }
     const text = content.trim();
-    if (!text) return false;
+    if (!text && !imageDataUrl) return false;
     try {
+      let imageUrl: string | undefined;
+      if (imageDataUrl) {
+        try {
+          imageUrl = await uploadImage(dataUrlToFile(imageDataUrl));
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : "图片上传失败");
+          return false;
+        }
+      }
       const res = await fetch(
         `${API_BASE}/api/posts/${post.id.replace("db-", "")}/comments`,
         {
@@ -261,7 +274,7 @@ function FeedView({
             "Content-Type": "application/json",
             Authorization: `Bearer ${token}`,
           },
-          body: JSON.stringify({ content: text }),
+          body: JSON.stringify({ content: text, image_url: imageUrl ?? null }),
         }
       );
       const data = await res.json().catch(() => null);
@@ -279,6 +292,7 @@ function FeedView({
           color: "bg-violet-200",
           time: "刚刚",
           content: text,
+          image: n.image_url ?? undefined,
           likes: 0,
           replies: [],
         },

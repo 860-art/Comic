@@ -14,6 +14,8 @@ export interface CommentItem {
   color: string;
   time: string;
   content: string;
+  /** 评论附图（R2 公网 URL）：渲染在正文下方，点击放大查看 */
+  image?: string;
   likes: number;
   replies: CommentItem[];
 }

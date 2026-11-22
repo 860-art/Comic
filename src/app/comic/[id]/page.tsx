@@ -22,6 +22,7 @@ import { removePublishedComic } from "@/data/pendingComics";
 import CommentDrawer, { type CommentItem } from "@/components/CommentDrawer";
 import { formatTime } from "@/lib/time";
 import { getToken } from "@/lib/auth";
+import { dataUrlToFile, uploadImage } from "@/lib/upload";
 
 /**
  * 漫画详情页（玻璃拟态风格，真实后端版）：
@@ -60,6 +61,7 @@ interface ApiCommentRow {
   author_id: number;
   author_username: string;
   avatar_url: string | null;
+  image_url?: string | null;
   created_at: string;
 }
 
@@ -72,6 +74,7 @@ function toCommentItem(c: ApiCommentRow): CommentItem {
     color: "bg-violet-200",
     time: formatTime(c.created_at),
     content: c.content,
+    image: c.image_url ?? undefined,
     likes: 0,
     replies: [],
   };
@@ -356,7 +359,10 @@ export default function ComicDetailPage({
     setLikedComments((prev) => ({ ...prev, [id]: !prev[id] }));
 
   // 发布评论：未登录拦截 → POST 真实接口（带 Token）→ 用后端返回的真实身份插入最前
-  const handlePublish = async (content: string): Promise<boolean> => {
+  const handlePublish = async (
+    content: string,
+    imageDataUrl?: string
+  ): Promise<boolean> => {
     if (!isLoggedIn()) {
       showToast("未登录");
       return false;
@@ -366,11 +372,21 @@ export default function ComicDetailPage({
       return false;
     }
     const text = content.trim();
-    if (!text) return false;
+    if (!text && !imageDataUrl) return false;
     const token = getToken();
     if (!token) {
       showToast("未登录");
       return false;
+    }
+    // 评论配图：先上传 R2 拿公网 URL，再随评论一起入库
+    let imageUrl: string | undefined;
+    if (imageDataUrl) {
+      try {
+        imageUrl = await uploadImage(dataUrlToFile(imageDataUrl));
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : "图片上传失败");
+        return false;
+      }
     }
     try {
       const res = await fetch(`${API_BASE}/api/comics/${comic.id}/comments`, {
@@ -379,7 +395,7 @@ export default function ComicDetailPage({
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ content: text }),
+        body: JSON.stringify({ content: text, image_url: imageUrl ?? null }),
       });
       const data = await res.json().catch(() => null);
       if (!res.ok) {

@@ -1,9 +1,9 @@
 /* eslint-disable @next/next/no-img-element */
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ChevronDown, Plus, ThumbsUp, X } from "lucide-react";
+import { ChevronDown, ImagePlus, Plus, ThumbsUp, X } from "lucide-react";
 import { findUserByName, getSpaceHref, ME_DEFAULT_NAME } from "@/data/posts";
 import { type CommentItem } from "@/data/comments";
 
@@ -23,16 +23,19 @@ function avatarFallback(name: string): string {
   return `https://ui-avatars.com/api/?name=${encodeURIComponent(name) || "U"}&background=7C3AED&color=fff`;
 }
 
-/** 单条评论：头像 + @名字（可点击跳转空间） + 正文 + 时间 + 点赞/回复 */
+/** 单条评论：头像 + @名字（可点击跳转空间） + 正文 + 配图 + 时间 + 点赞/回复 */
 function CommentItemView({
   comment,
   liked,
   onToggleLike,
+  onImageClick,
   compact = false,
 }: {
   comment: CommentItem;
   liked: boolean;
   onToggleLike: (id: string) => void;
+  /** 点击评论配图 → 全屏放大查看 */
+  onImageClick: (url: string) => void;
   compact?: boolean;
 }) {
   const router = useRouter();
@@ -71,9 +74,25 @@ function CommentItemView({
         >
           @{comment.author}
         </button>
-        <p className="mt-1 text-sm leading-relaxed text-gray-800">
-          {comment.content}
-        </p>
+        {comment.content && (
+          <p className="mt-1 text-sm leading-relaxed text-gray-800">
+            {comment.content}
+          </p>
+        )}
+        {/* 评论配图：正文下方展示，点击全屏放大 */}
+        {comment.image && (
+          <button
+            type="button"
+            onClick={() => onImageClick(comment.image as string)}
+            className="mt-2 block"
+          >
+            <img
+              src={comment.image}
+              alt="评论配图"
+              className="max-h-56 max-w-full cursor-zoom-in rounded-xl border border-gray-200 object-cover"
+            />
+          </button>
+        )}
         <p className="mt-1 text-xs text-gray-400">{comment.time}</p>
         {/* 点赞按钮在正文右下侧：变红 + 数字 +1，带缩放动画 */}
         <div className="mt-2 flex items-center gap-5">
@@ -118,18 +137,47 @@ export default function CommentDrawer({
   loading?: boolean;
   likedComments: Record<string, boolean>;
   onToggleLike: (id: string) => void;
-  /** 发布回调：返回 true（或 Promise<true>）表示发布成功，抽屉随之清空输入框 */
-  onPublish: (content: string) => boolean | Promise<boolean>;
+  /**
+   * 发布回调：返回 true（或 Promise<true>）表示发布成功，抽屉随之清空输入框与配图。
+   * imageDataUrl：加号选择的图片（本地 dataURL），由调用方上传后随评论保存
+   */
+  onPublish: (
+    content: string,
+    imageDataUrl?: string
+  ) => boolean | Promise<boolean>;
 }) {
   const [draft, setDraft] = useState("");
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // ===== 附图评论：加号菜单 / 待发布配图预览 / 配图放大查看 =====
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [pendingImage, setPendingImage] = useState<string | null>(null);
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   // 动态绑定列表长度：发布一条，数字自动 +1，与列表内容永远一致
   const total = comments.length;
 
+  // 输入框有内容（文字或配图）→ 发布按钮变紫色可用态
+  const hasInput = Boolean(draft.trim() || pendingImage);
+
   const handlePublishClick = async () => {
-    const ok = await onPublish(draft);
-    if (ok) setDraft("");
+    if (!hasInput) return;
+    const ok = await onPublish(draft, pendingImage || undefined);
+    if (ok) {
+      setDraft("");
+      setPendingImage(null);
+    }
+  };
+
+  // 选择照片：读入本地文件转 dataURL 预览（上传与保存由调用方在发布时完成）
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    setMenuOpen(false);
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setPendingImage(typeof reader.result === "string" ? reader.result : null);
+    reader.readAsDataURL(file);
+    e.target.value = ""; // 允许再次选择同一张图
   };
 
   return (
@@ -173,7 +221,7 @@ export default function CommentDrawer({
             </div>
           </div>
 
-          {/* 输入区：多行输入框 + 加号 + 发表评论（玻璃态按钮） */}
+          {/* 输入区：多行输入框 + 加号（选图菜单）+ 发表评论（有内容时变紫） */}
           <div className="shrink-0 border-b border-gray-200/80 px-5 py-4">
             <div className="relative">
               <textarea
@@ -186,15 +234,80 @@ export default function CommentDrawer({
               <button
                 type="button"
                 aria-label="添加内容"
-                className="absolute right-3 top-3 flex h-7 w-7 items-center justify-center rounded-full border border-white/20 bg-black/40 text-white backdrop-blur-md"
+                onClick={() => setMenuOpen(true)}
+                className="absolute right-3 top-3 flex h-7 w-7 items-center justify-center rounded-full border border-white/20 bg-black/40 text-white backdrop-blur-md transition-transform active:scale-90"
               >
                 <Plus className="h-4 w-4" />
               </button>
+
+              {/* 加号菜单：选择照片 / 取消 */}
+              {menuOpen && (
+                <>
+                  <div
+                    className="fixed inset-0 z-[95]"
+                    onClick={() => setMenuOpen(false)}
+                  />
+                  <div className="absolute right-0 top-10 z-[96] w-44 overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
+                    <button
+                      type="button"
+                      onClick={() => fileRef.current?.click()}
+                      className="flex w-full items-center gap-2 px-4 py-3 text-sm text-gray-800 transition-colors hover:bg-gray-50"
+                    >
+                      <ImagePlus className="h-4 w-4 text-violet-500" />
+                      选择照片
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setMenuOpen(false)}
+                      className="flex w-full items-center gap-2 border-t border-gray-100 px-4 py-3 text-sm text-gray-500 transition-colors hover:bg-gray-50"
+                    >
+                      <X className="h-4 w-4" />
+                      取消
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
+
+            {/* 隐藏的文件选择框 */}
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={handleFileChange}
+            />
+
+            {/* 待发布配图预览：缩略图 + 移除 */}
+            {pendingImage && (
+              <div className="mt-3 flex items-center gap-3">
+                <div className="relative">
+                  <img
+                    src={pendingImage}
+                    alt="待发布的评论配图"
+                    className="h-20 w-20 rounded-xl border border-gray-200 object-cover"
+                  />
+                  <button
+                    type="button"
+                    aria-label="移除配图"
+                    onClick={() => setPendingImage(null)}
+                    className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-white"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+                <p className="text-xs text-gray-400">发布后图片将随评论一起展示</p>
+              </div>
+            )}
+
             <button
               type="button"
               onClick={handlePublishClick}
-              className="mt-3 w-full rounded-2xl border border-white/20 bg-black/40 py-3 text-sm font-medium text-white backdrop-blur-md transition-all hover:bg-black/55 active:scale-[0.98]"
+              className={`mt-3 w-full rounded-2xl border border-white/20 py-3 text-sm font-medium text-white backdrop-blur-md transition-all active:scale-[0.98] ${
+                hasInput
+                  ? "bg-violet-500 hover:bg-violet-400"
+                  : "bg-black/40 hover:bg-black/55"
+              }`}
             >
               发表评论
             </button>
@@ -221,6 +334,7 @@ export default function CommentDrawer({
                   comment={c}
                   liked={!!likedComments[c.id]}
                   onToggleLike={onToggleLike}
+                  onImageClick={setLightboxUrl}
                 />
                 {c.replies.length > 0 && (
                   <div className="mt-3">
@@ -246,6 +360,7 @@ export default function CommentDrawer({
                             comment={r}
                             liked={!!likedComments[r.id]}
                             onToggleLike={onToggleLike}
+                            onImageClick={setLightboxUrl}
                             compact
                           />
                         ))}
@@ -259,6 +374,28 @@ export default function CommentDrawer({
             </div>
             </div>
             </div>
+
+            {/* 评论配图放大查看：全屏遮罩，点击任意处关闭 */}
+            {lightboxUrl && (
+              <div
+                className="fixed inset-0 z-[120] flex items-center justify-center bg-black/90"
+                onClick={() => setLightboxUrl(null)}
+              >
+                <img
+                  src={lightboxUrl}
+                  alt="评论配图放大"
+                  className="max-h-[85vh] max-w-full cursor-zoom-out object-contain"
+                />
+                <button
+                  type="button"
+                  aria-label="关闭放大"
+                  onClick={() => setLightboxUrl(null)}
+                  className="absolute right-4 top-4 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+            )}
             </>
             );
             }

@@ -26,3 +26,13 @@ export async function uploadImage(file: File): Promise<string> {
   if (!data.url) throw new Error("上传接口未返回图片地址");
   return data.url;
 }
+
+/** dataURL → File（评论配图在抽屉里以预览 dataURL 形式暂存，发布时转回 File 上传） */
+export function dataUrlToFile(dataUrl: string, filename = "comment-image.png"): File {
+  const [meta, base64] = dataUrl.split(",");
+  const mime = meta.match(/:(.*?);/)?.[1] || "image/png";
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new File([bytes], filename, { type: mime });
+}
