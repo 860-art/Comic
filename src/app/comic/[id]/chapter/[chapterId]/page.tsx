@@ -266,7 +266,7 @@ export default function ComicReadPage({
   const hasEmptyPage = successEntries.some(([i]) => (translations[Number(i)] ?? []).length === 0);
   const hasTranslation = Object.keys(translations).length > 0;
 
-  const runTranslate = async () => {
+  const runTranslate = async (force = false) => {
     const pages = images;
     if (!pages || pages.length === 0) {
       setToastMsg("本章节没有可翻译的内页图");
@@ -281,8 +281,15 @@ export default function ComicReadPage({
     setIsTranslateDrawerOpen(false);
     setShowTranslated(true); // 立即切到译文模式：先完成的页面马上展示气泡
 
+    // 重新翻译：先清空旧的译文与状态，后端缓存也由 force 同步清除，重新保存全新结果
+    if (force) {
+      setTranslations({});
+      setPageStatus({});
+    }
+
     // 并发发起 N 个独立请求（不用 await Promise.all 阻塞渲染）：
     // 每页只更新自己的状态，哪个先返回哪个先渲染
+    let failDetail = "";
     const jobs = pages.map(async (src, i): Promise<boolean> => {
       setPageStatus((prev) => ({ ...prev, [i]: "loading" }));
       try {
@@ -290,7 +297,13 @@ export default function ComicReadPage({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           // BYOK：带上用户自己保存的 Key（为空时后端自动降级服务器 Key）
-          body: JSON.stringify({ image_url: src, lang: "en", api_key: savedKey.trim() }),
+          // force：重新翻译时让后端清掉旧缓存重跑，避免命中旧的伪翻译/混入原文结果
+          body: JSON.stringify({
+            image_url: src,
+            lang: "en",
+            api_key: savedKey.trim(),
+            force,
+          }),
         });
         const data = await res.json().catch(() => null);
         if (res.ok && Array.isArray(data)) {
@@ -298,6 +311,8 @@ export default function ComicReadPage({
           setPageStatus((prev) => ({ ...prev, [i]: "success" }));
           return true;
         }
+        const detail = (data as { detail?: string } | null)?.detail;
+        if (detail) failDetail = detail;
         setPageStatus((prev) => ({ ...prev, [i]: "idle" }));
         return false;
       } catch {
@@ -313,7 +328,7 @@ export default function ComicReadPage({
       okCount === pages.length
         ? `全部 ${pages.length} 页翻译完成`
         : okCount === 0
-          ? "翻译失败，请确认后端已启动"
+          ? failDetail || "翻译失败，请确认后端已启动"
           : `完成 ${okCount}/${pages.length} 页，其余可稍后重试`
     );
     setTimeout(() => setToastMsg(null), 2500);
@@ -327,7 +342,8 @@ export default function ComicReadPage({
       setTimeout(() => setToastMsg(null), 2000);
       return;
     }
-    runTranslate();
+    // 已有译文时按钮是「重新翻译」→ force 清缓存与旧译文后重新保存
+    runTranslate(hasTranslation);
   };
 
   // 底部按钮文案：已有结果 → 重新翻译；AI Tab 未存密钥 → 保存；其余 → 翻译

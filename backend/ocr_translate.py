@@ -367,7 +367,42 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 _TRANSLATE_PROMPT = (
     "你是漫画对白翻译器。把 JSON 数组里的英文（或韩文）台词翻译成自然流畅的简体中文，"
     "保留语气词和口语感。只返回一个 JSON 数组，元素顺序与输入一一对应，不要输出任何解释。"
+    "严禁保留原文、外文单词或拼音，每个数组元素都必须是纯中文译文。"
 )
+
+# ===== 译文中文校验 =====
+# 大模型偶尔偷懒：数组里只有一部分翻成中文，其余原样返回英文/韩文/日文；
+# 或者返回伪翻译 "[译] 原文"。这些结果一旦写入缓存会永久显示，必须在入缓存前拦住。
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+# 连续 3 个以上拉丁字母（放行 OK/AI 这类 2 字母缩写）/ 任意韩文音节 / 任意日文假名
+# → 判定为原文残留
+_FOREIGN_RE = re.compile(r"[A-Za-z]{3,}|[\uac00-\ud7af\u3130-\u318f]|[\u3040-\u30ff]")
+
+
+def _is_chinese_translation(text: str) -> bool:
+    """单条译文是否为合规中文：至少含一个汉字，且不含成串外文与伪翻译标记。"""
+    t = (text or "").strip()
+    if not t or not _CJK_RE.search(t):
+        return False
+    if "[译]" in t or _FOREIGN_RE.search(t):
+        return False
+    return True
+
+
+def _translations_all_chinese(translated: list[str]) -> bool:
+    """整张图的所有译文必须全部为中文（逐条检查，空数组视为合规：图片本身无文字）。"""
+    return all(_is_chinese_translation(t) for t in translated)
+
+
+def _result_all_chinese(result) -> bool:
+    """缓存里的完整结果（JSON 字符串或已解析列表）是否全部为中文译文。"""
+    try:
+        rows = json.loads(result) if isinstance(result, str) else result
+        if not isinstance(rows, list):
+            return False
+        return all(_is_chinese_translation(str(r.get("translated", ""))) for r in rows)
+    except Exception:
+        return False
 
 
 def _mask_key(key: str) -> str:
@@ -377,8 +412,10 @@ def _mask_key(key: str) -> str:
     return f"{key[:4]}****{key[-4:]}"
 
 
-def _llm_translate(texts: list[str], user_api_key: str = "") -> Optional[list[str]]:
-    """调用 LLM 批量翻译；失败返回 None（调用方回退伪翻译）。
+def _llm_translate_once(
+    texts: list[str], user_api_key: str = "", temperature: float = 0.3
+) -> Optional[list[str]]:
+    """单次调用 LLM 批量翻译；失败或无法解析为等长数组返回 None。
 
     BYOK 优先级：前端传来的用户 Key > 服务器环境变量 ZHIPU_API_KEY > DEEPSEEK_API_KEY。
     """
@@ -407,7 +444,7 @@ def _llm_translate(texts: list[str], user_api_key: str = "") -> Optional[list[st
             {"role": "system", "content": _TRANSLATE_PROMPT},
             {"role": "user", "content": json.dumps(texts, ensure_ascii=False)},
         ],
-        "temperature": 0.3,
+        "temperature": temperature,
     }
     # 强制排查：打印实际发给大模型的 Prompt（system + user），核对长句与 JSON 格式
     print(f"[translate] 发送给 LLM 的 system prompt: {_TRANSLATE_PROMPT}")
@@ -437,7 +474,29 @@ def _llm_translate(texts: list[str], user_api_key: str = "") -> Optional[list[st
         # 强制排查：任何网络/解析异常都打在终端里
         print(f"[translate] LLM 调用异常: {type(exc).__name__}: {exc}")
         return None
-    print("[translate] LLM 返回内容无法解析为等长 JSON 数组，回退伪翻译")
+    print("[translate] LLM 返回内容无法解析为等长 JSON 数组")
+    return None
+
+
+def _llm_translate(texts: list[str], user_api_key: str = "") -> Optional[list[str]]:
+    """翻译并校验：整张图每条译文都必须是中文，否则重试一次；仍不合格返回 None。
+
+    返回的 None 会让接口报 502 且【不写缓存】，彻底杜绝"有些是中文有些是原文"
+    以及伪翻译被永久缓存污染的问题。
+    """
+    for attempt, temp in ((1, 0.3), (2, 0.7)):
+        translated = _llm_translate_once(texts, user_api_key, temperature=temp)
+        if translated is None:
+            return None
+        bad = [t for t in translated if not _is_chinese_translation(t)]
+        if not bad:
+            print(f"[translate] 中文校验通过：{len(translated)} 条译文全部为中文")
+            return translated
+        print(
+            f"[translate] 第 {attempt} 次返回 {len(bad)}/{len(translated)} 条非中文，"
+            f"示例: {bad[:2]!r}"
+        )
+    print("[translate] 重试后仍含非中文译文，放弃本次结果（不写缓存）")
     return None
 
 
@@ -640,6 +699,24 @@ def _cache_put(image_hash: str, image_url: str, result: list[dict], overwrite: b
         print(f"[translate] 缓存写入失败（不影响翻译结果）: {type(exc).__name__}: {exc}")
 
 
+def _cache_delete(image_hash: str) -> None:
+    """删除该图的翻译缓存（用户点『重新翻译』或发现脏缓存时调用）。"""
+    try:
+        from main import SessionLocal, TranslationCache
+
+        db = SessionLocal()
+        try:
+            db.query(TranslationCache).filter(
+                TranslationCache.image_hash == image_hash
+            ).delete(synchronize_session=False)
+            db.commit()
+            print(f"[translate] 已清除旧缓存 hash={image_hash[:16]}…")
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[translate] 清除缓存失败（不影响重译）: {type(exc).__name__}: {exc}")
+
+
 # ===== 接口：POST /api/translate =====
 
 
@@ -650,8 +727,10 @@ async def translate_comic(request: Request):
     支持两种请求：
     - application/json：{"image_url": "https://... 或 data:image/...;base64,...", "lang": "en"}
     - multipart/form-data：file=<图片文件>&lang=en（也接受 image_url 字段）
+    - force=true：用户点『重新翻译』→ 先清除该图旧缓存，重新识别翻译后重新保存
 
     返回：[{"box": [x, y, w, h], "bg_color": "#f5f5dc", "original": "...", "translated": "..."}]
+    译文必须整张全部为中文，否则返回 502 且不写缓存（避免脏结果被永久缓存）。
     """
     # 接口开头强制排查：Key 长度为 0 = 当前进程环境没有注入 Key（会走伪翻译）
     print("Key 长度:", len(os.getenv("ZHIPU_API_KEY", "")))
@@ -660,12 +739,14 @@ async def translate_comic(request: Request):
     lang_raw: str = "en"
     user_api_key: str = ""
     file_bytes: Optional[bytes] = None
+    force: bool = False
 
     if content_type.startswith("multipart/"):
         form = await request.form()
         image_url = form.get("image_url")  # type: ignore[assignment]
         lang_raw = str(form.get("lang") or "en")
         user_api_key = str(form.get("api_key") or "").strip()  # BYOK：用户自带 Key
+        force = str(form.get("force") or "").lower() in ("1", "true", "yes")
         upload = form.get("file")
         if upload is not None and hasattr(upload, "read"):
             file_bytes = await upload.read()
@@ -677,6 +758,7 @@ async def translate_comic(request: Request):
         image_url = body.get("image_url")  # type: ignore[assignment]
         lang_raw = str(body.get("lang") or "en")
         user_api_key = str(body.get("api_key") or "").strip()  # BYOK：用户自带 Key
+        force = bool(body.get("force"))
 
     lang = SUPPORTED_LANGS.get(lang_raw.lower())
     if lang is None:
@@ -692,10 +774,23 @@ async def translate_comic(request: Request):
 
     # 翻译结果缓存：按图片内容 SHA256 唯一标识（同图不同 URL 形式/不同 Key 都命中同一条）
     cache_key = hashlib.sha256(img_bytes).hexdigest()
-    cached_json = _cache_get(cache_key)
-    if cached_json is not None:
-        print(f"[缓存命中] hash={cache_key[:16]}… 跳过 OCR 与大模型调用，直接返回缓存结果")
-        return json.loads(cached_json)
+    # 用户点『重新翻译』：清掉旧缓存（含历史脏译文），本次重新 OCR + 翻译并重新保存
+    if force:
+        _cache_delete(cache_key)
+        print(f"[重新翻译] hash={cache_key[:16]}… 已清除旧缓存，重新识别与翻译")
+    else:
+        cached_json = _cache_get(cache_key)
+        if cached_json is not None:
+            try:
+                cached_result = json.loads(cached_json)
+            except Exception:
+                cached_result = None
+            # 只有整张全部为中文的缓存才可用；历史伪翻译/混入原文的脏缓存直接废弃
+            if cached_result is not None and _result_all_chinese(cached_result):
+                print(f"[缓存命中] hash={cache_key[:16]}… 跳过 OCR 与大模型调用，直接返回缓存结果")
+                return cached_result
+            print("[缓存] 旧缓存含非中文译文，废弃并重新翻译")
+            _cache_delete(cache_key)
     print(f"[新图翻译并写入缓存] hash={cache_key[:16]}… 未命中，开始 OCR + 翻译")
 
     # OCR（模型未就绪/下载失败 → 503，提示如何手动放置模型）
@@ -775,8 +870,11 @@ async def translate_comic(request: Request):
     print(f"[translate] 最终发给大模型的文本({len(texts)} 条): {texts}")
     translated = _llm_translate(texts, user_api_key=user_api_key)
     if translated is None:
-        # 未配置 Key 或调用失败 → 伪翻译，保证流程可先跑通
-        translated = [f"[译] {t}" for t in texts]
+        # 未配置 Key / 调用失败 / 译文不是中文 → 不写缓存、不返回脏译文，让前端明确报错重试
+        raise HTTPException(
+            status_code=502,
+            detail="翻译未获得合规中文译文（密钥未配置、模型返回原文或超时），请稍后重试",
+        )
 
     result = [
         {

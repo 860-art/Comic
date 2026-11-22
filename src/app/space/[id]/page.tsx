@@ -3,47 +3,145 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, AtSign } from "lucide-react";
 import {
   SPACE_USERS,
+  ME_DEFAULT_AVATAR,
+  ME_DEFAULT_BANNER,
   formatFans,
   getUserStats,
   loadFollowIds,
   loadPosts,
   saveFollowIds,
   type SocialPost,
+  type SpaceUser,
   type UserStats,
 } from "@/data/posts";
+import { API_BASE } from "@/lib/api";
+import { formatTime } from "@/lib/time";
 
 /**
  * 他人空间页（/space/[id]）：
  * - 从广场/评论区点击他人头像或名字进入
- * - 展示假数据：背景 Banner + 头像（层级关系与个人中心相同）+ 名字 + 粉丝数 + 关注按钮 + TA 的帖子
- * - 关注按钮：点击变灰色『已关注』并写入 localStorage('follows')，粉丝数实时 +1（useState）
+ * - 假数据用户（u1~u9）沿用本地帖子；真实数据库用户（authorId 为数字 id）
+ *   走 GET /api/users/{id} + GET /api/posts，展示真实头像/背景/动态
+ * - 关注按钮：点击变灰色『已关注』并写入 localStorage('follows')，粉丝数实时 +1
  */
+
+/** 后端 GET /api/posts 返回的单条数据结构 */
+interface ApiPost {
+  id: number;
+  content: string | null;
+  image_url: string | null;
+  image_urls?: string[] | null;
+  mention_username?: string | null;
+  author_id: number;
+  author_username: string;
+  likes: number;
+  created_at: string;
+}
+
+function toSocialPost(p: ApiPost): SocialPost {
+  return {
+    id: `db-${p.id}`,
+    title: "",
+    authorId: String(p.author_id),
+    author: p.author_username,
+    followers: 0,
+    tags: [],
+    images:
+      p.image_urls && p.image_urls.length > 0
+        ? p.image_urls
+        : p.image_url
+          ? [p.image_url]
+          : [],
+    likes: p.likes ?? 0,
+    heat: "",
+    intro: p.content ?? "",
+    time: formatTime(p.created_at),
+    comments: [],
+    commentsCount: 0,
+    mention: p.mention_username ?? undefined,
+  };
+}
 
 export default function OtherSpacePage() {
   const router = useRouter();
   // 动态路由参数（useParams 更稳，避免使用 ctx.params）
   const [userId, setUserId] = useState<string | null>(null);
+  const [user, setUser] = useState<SpaceUser | null>(null);
+  const [loading, setLoading] = useState(true);
   const [followed, setFollowed] = useState(false);
   const [userPosts, setUserPosts] = useState<SocialPost[]>([]);
   // 真实统计：粉丝 = 小基数 + 关注 +1；获赞 = 基础值 + 帖子点赞总和
   const [stats, setStats] = useState<UserStats>({ fans: 0, likes: 0, postCount: 0 });
 
   useEffect(() => {
-    // 从 URL 提取 id：/space/u1
+    // 从 URL 提取 id：/space/u1（假数据）或 /space/3（真实数据库用户）
     const path = window.location.pathname;
     const id = path.replace(/^\/space\//, "").replace(/\/$/, "");
     setUserId(id || null);
     const followedNow = loadFollowIds().includes(id);
     setFollowed(followedNow);
-    const all = loadPosts();
-    setUserPosts(all.filter((p) => p.authorId === id));
-    setStats(getUserStats(id, all, followedNow));
-  }, []);
 
-  const user = SPACE_USERS.find((u) => u.id === userId);
+    // 1) 假数据用户：沿用本地帖子与统计
+    const mock = SPACE_USERS.find((u) => u.id === id);
+    if (mock) {
+      setUser(mock);
+      const all = loadPosts();
+      setUserPosts(all.filter((p) => p.authorId === id));
+      setStats(getUserStats(id, all, followedNow));
+      setLoading(false);
+      return;
+    }
+
+    // 2) 真实数据库用户：公开资料 + 全站帖子过滤出 TA 的动态
+    if (!/^\d+$/.test(id)) {
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const [profileRes, postsRes] = await Promise.all([
+          fetch(`${API_BASE}/api/users/${id}`),
+          fetch(`${API_BASE}/api/posts`),
+        ]);
+        if (cancelled) return;
+        if (profileRes.status === 404) {
+          setUser(null);
+          return;
+        }
+        if (!profileRes.ok) throw new Error(`HTTP ${profileRes.status}`);
+        const profile = await profileRes.json();
+        const all: ApiPost[] = postsRes.ok ? await postsRes.json() : [];
+        const mine = all
+          .filter((p) => p.author_id === Number(id))
+          .map(toSocialPost);
+        setUser({
+          id,
+          name: profile.username,
+          avatar: profile.avatar_url || ME_DEFAULT_AVATAR,
+          banner: profile.cover_url || ME_DEFAULT_BANNER,
+          fans: 0,
+          baseLikes: 0,
+        });
+        setUserPosts(mine);
+        setStats({
+          fans: followedNow ? 1 : 0,
+          likes: mine.reduce((sum, p) => sum + (p.likes || 0), 0),
+          postCount: mine.length,
+        });
+      } catch {
+        setUser(null);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // 关注/取关：localStorage 持久化 + React state 实时联动粉丝数
   const toggleFollow = () => {
@@ -56,10 +154,21 @@ export default function OtherSpacePage() {
       saveFollowIds(ids.filter((id) => id !== userId));
     }
     setFollowed(nowFollowed);
-    setStats(getUserStats(userId, loadPosts(), nowFollowed));
+    setStats((prev) => ({
+      ...prev,
+      fans: prev.fans + (nowFollowed ? 1 : -1),
+    }));
   };
 
-  // 用户不存在：占位提示
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-white text-sm text-zinc-400">
+        加载中…
+      </div>
+    );
+  }
+
+  // 用户不存在：占位提示（仅后端明确 404 或 id 非法时）
   if (!user) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-white px-6 text-center">
@@ -174,6 +283,12 @@ export default function OtherSpacePage() {
                 <p className="mt-2 whitespace-pre-line text-sm leading-relaxed text-zinc-800">
                   {post.intro}
                 </p>
+              )}
+              {post.mention && (
+                <span className="mt-2 inline-flex items-center gap-0.5 rounded-full bg-violet-100 px-2.5 py-0.5 text-xs font-medium text-violet-600">
+                  <AtSign className="h-3 w-3" />
+                  {post.mention}
+                </span>
               )}
               {post.tags.length > 0 && (
                 <div className="mt-2 flex flex-wrap gap-1.5">

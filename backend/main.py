@@ -1397,6 +1397,26 @@ def read_me(user: User = Depends(get_current_user)):
     return {"user": user_profile(user)}
 
 
+@app.get("/api/users/{user_id}")
+def public_user_profile(user_id: int, db: Session = Depends(get_db)):
+    """他人空间页用的公开资料（无需登录，绝不含邮箱/密码/生日等敏感字段）。
+
+    广场帖子的 authorId 是真实数据库用户 id；旧版他人空间页只查前端假数据
+    SPACE_USERS，导致真实用户点进去显示『用户不存在』，此接口补齐真实数据源。
+    """
+    target = db.query(User).filter(User.id == user_id).first()
+    if target is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {
+        "id": target.id,
+        "username": target.username,
+        "avatar_url": target.avatar_url,
+        "cover_url": target.cover_url,
+        "signature": target.signature,
+        "tags": json.loads(target.tags or "[]"),
+    }
+
+
 @app.put("/api/auth/me")
 def update_me(
     req: ProfileUpdate,
