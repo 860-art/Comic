@@ -54,7 +54,8 @@ MIN_MEANINGFUL_CHARS = 2     # 有效字符（去掉标点/空白后的字母数
 # 2核4G 服务器内存吃紧且推理慢 → 中/英/日显式切换 Mobile 轻量模型（det ~5MB / rec ~16MB）。
 # 返回结构与 Server 版完全一致（rec_texts 等 dict），下游解析零改动。
 _MOBILE_DET = "PP-OCRv5_mobile_det"
-_MOBILE_REC = "PP-OCRv5_mobile_rec"
+_MOBILE_REC = "PP-OCRv5_mobile_rec"          # 通用字典：中/英/日文假名
+_KOREAN_MOBILE_REC = "korean_PP-OCRv5_mobile_rec"  # 韩文专用轻量模型（通用字典不含韩文）
 
 _ocr_instances: dict[str, object] = {}
 _ocr_lock = threading.Lock()
@@ -63,10 +64,14 @@ _ocr_lock = threading.Lock()
 def _get_ocr(lang: str):
     """获取（或初始化）PaddleOCR 实例（Mobile 轻量模型）。模型下载失败会抛异常，由接口转成 503。
 
-    模型选择策略：
+    模型选择策略（paddleocr 3.7.0 实测）：
     - 检测模型与语言无关（只找文字位置）→ 全语言统一用 PP-OCRv5_mobile_det
-    - 识别模型必须匹配语言字典：中/英/日用 PP-OCRv5_mobile_rec；
-      韩文 PP-OCRv5 不支持 → 不显式指定，落到默认 korean_PP-OCRv4_mobile_rec（本身就是轻量版）
+    - 中/英/日 → 识别用 PP-OCRv5_mobile_rec（字典含中文、英文、日文假名）
+    - 韩文 → 必须用 korean_PP-OCRv5_mobile_rec（通用 v5 字典不含韩文字符）
+    - 关键坑：只要显式指定了任意模型名，PaddleOCR 3.x 就会忽略 lang 参数
+      （警告 "'lang' and 'ocr_version' will be ignored when model names are specified"）。
+      因此韩文不能"只指定 det 让 lang 生效"——实测那样会回退到 PP-OCRv6_medium_rec
+      中英文大模型，韩文识别直接失效且更占内存。两个模型名都要显式指定。
     - 显式指定失败时回退默认配置（绝不因模型选择问题破坏原有识别功能）
     """
     with _ocr_lock:
@@ -84,9 +89,11 @@ def _get_ocr(lang: str):
             )
             try:
                 if lang == "korean":
-                    # 韩文：识别模型用默认（韩文专用轻量模型），检测模型仍换 Mobile
+                    # 韩文：两个模型名都显式指定（lang 此时会被忽略，不能依赖它选 rec）
                     _ocr_instances[lang] = PaddleOCR(
-                        text_detection_model_name=_MOBILE_DET, **base_kwargs
+                        text_detection_model_name=_MOBILE_DET,
+                        text_recognition_model_name=_KOREAN_MOBILE_REC,
+                        **base_kwargs,
                     )
                 else:
                     _ocr_instances[lang] = PaddleOCR(
