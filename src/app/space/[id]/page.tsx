@@ -505,11 +505,11 @@ export default function OtherSpacePage() {
           <div className="flex items-start pl-44 pr-6 pt-8">
             <div className="min-w-0 flex-1">
               <p className="text-2xl font-bold text-zinc-900">{user.name}</p>
-              {/* 粉丝 / 动态 / 获赞：各占一行分段显示 */}
-              <p className="mt-2 text-sm text-zinc-500">
+              {/* 粉丝 / 动态·获赞：窄屏也强制单行，不被右侧关注按钮挤到折行分段 */}
+              <p className="mt-2 whitespace-nowrap text-sm text-zinc-500">
                 {formatFans(stats.fans)} 粉丝
               </p>
-              <p className="mt-1 text-sm text-zinc-500">
+              <p className="mt-1 whitespace-nowrap text-xs tracking-tight text-zinc-500">
                 {stats.postCount} 动态 · 获赞 {stats.likes}
               </p>
             </div>
