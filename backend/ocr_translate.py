@@ -401,6 +401,9 @@ _TRANSLATE_PROMPT = (
     "你是漫画对白翻译器。把 JSON 数组里的英文（或韩文）台词翻译成自然流畅的简体中文，"
     "保留语气词和口语感。只返回一个 JSON 数组，元素顺序与输入一一对应，不要输出任何解释。"
     "严禁保留原文、外文单词或拼音，每个数组元素都必须是纯中文译文。"
+    "人名、地名、拟声词、单字母、纯符号也要音译或意译成汉字"
+    "（例如 SISTER DANA → 达娜修女，S- → 咝，AH! → 啊！），"
+    "绝不要因为文本很短就原样返回；返回数组的元素个数必须与输入完全一致。"
 )
 
 # ===== 译文中文校验 =====
@@ -1128,18 +1131,37 @@ def _llm_translate_serial(
 ) -> Optional[list[str]]:
     """OCR 之后小批量串行翻译：按 batch_size 切片逐批调 LLM，批间不并发。
 
-    每批沿用 _llm_translate 的中文校验 + 温度重试；任何一批失败 → 整页失败（返回 None），
-    绝不写入部分结果。返回与输入等长的完整译文数组。
+    每批沿用 _llm_translate 的中文校验 + 温度重试。整批失败时（常见于一批里混了
+    拟声词/人名/单字母短句，模型返回原文或 JSON 少一条），自动**降级为逐条翻译**：
+    单条短文本单独问模型成功率高得多，1 条难翻不再毁掉整页。
+    逐条仍失败才整页返回 None（绝不写部分结果、不写脏译文）。
     """
     out: list[str] = []
     for start in range(0, len(texts), batch_size):
         chunk = texts[start : start + batch_size]
+        batch_no = start // batch_size + 1
         translated = _llm_translate(chunk, user_api_key)
+        if translated is not None and len(translated) != len(chunk):
+            print(
+                f"[task] 第 {batch_no} 批返回 {len(translated)} 条（应为 {len(chunk)}），按失败处理"
+            )
+            translated = None
         if translated is None:
             print(
-                f"[task] 小批量翻译第 {start // batch_size + 1} 批（{len(chunk)} 条）失败，整页放弃"
+                f"[task] 小批量翻译第 {batch_no} 批（{len(chunk)} 条）整批失败，"
+                f"降级为逐条翻译重试: {chunk!r}"
             )
-            return None
+            recovered: list[str] = []
+            for j, single in enumerate(chunk):
+                one = _llm_translate([single], user_api_key)
+                if one is None or len(one) != 1:
+                    print(
+                        f"[task] 第 {batch_no} 批第 {j + 1} 条逐条重试仍失败: {single!r}，整页放弃"
+                    )
+                    return None
+                recovered.extend(one)
+            translated = recovered
+            print(f"[task] 第 {batch_no} 批逐条重试全部成功（{len(recovered)} 条）")
         out.extend(translated)
     return out
 
