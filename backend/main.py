@@ -292,6 +292,37 @@ class TranslationCache(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+# ===== 异步翻译任务表（数据库队列）：幂等键 comic_id+page_id+target_lang =====
+class TranslationTask(Base):
+    __tablename__ = "translation_tasks"
+    __table_args__ = (
+        UniqueConstraint("comic_id", "page_id", "target_lang", name="uq_translate_task"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    comic_id: Mapped[int] = mapped_column(Integer, index=True)
+    # 一页的唯一标识（前端用 "{chapterId}:{页下标}"）
+    page_id: Mapped[str] = mapped_column(String(128), index=True)
+    # 目标语言（目前固定 zh）；OCR 源语言单独存 lang
+    target_lang: Mapped[str] = mapped_column(String(12), default="zh")
+    lang: Mapped[str] = mapped_column(String(12), default="en")
+    # 该页图片地址（对象存储公网 URL），worker 执行时下载
+    image_url: Mapped[str] = mapped_column(Text)
+    # queued 排队 / processing 执行中 / done 完成 / failed 重试耗尽
+    status: Mapped[str] = mapped_column(String(12), default="queued", index=True)
+    # 已执行次数（首次 + 最多 2 次重试 = 3）
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    # 完成后的完整结果（[{box, bg_color, original, translated}, ...]）
+    result_json: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    # 提交人：用于「每用户同时最多 1 个进行中任务」与调度轮转公平性
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
 # ===== 阶段一：先建表，再执行任何模块级数据库查询 =====
 # 下面 275 行起的轻量迁移、description 回填、AO 管理员初始化都是 import 时
 # 直接执行的代码，会查询 comics / users / pending_comics 等表。
@@ -600,8 +631,127 @@ app.add_middleware(
 
 # ===== OCR 漫画翻译（PaddleOCR Mobile + 百度备用 + OpenCV 取色 + GLM/DeepSeek）=====
 from ocr_translate import router as translate_router  # noqa: E402
+from ocr_translate import TASK_MAX_ATTEMPTS, start_translation_worker  # noqa: E402
 
 app.include_router(translate_router)
+
+
+# ===== 异步翻译任务接口：幂等提交 + 轮询状态 =====
+class TranslationTaskRequest(BaseModel):
+    """提交一页翻译任务。page_id 唯一标识一页（如 "{chapterId}:{下标}"）。"""
+
+    comic_id: int
+    page_id: str
+    image_url: str
+    # OCR 源语言（en/ko/japan/ch）
+    lang: str = "en"
+    # 目标语言（目前固定 zh）
+    target_lang: str = "zh"
+    # force=true：done 任务也重置排队重跑（对应前端「重新翻译」）
+    force: bool = False
+
+
+@app.post("/api/translate/tasks")
+def create_translation_task(
+    req: TranslationTaskRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """幂等提交翻译任务（异步，只返回 task_id，前端轮询状态）。
+
+    - 已 done（且非 force）→ 直接返回结果，不重复执行
+    - queued / processing → 直接返回 task_id，绝不重复入队
+    - failed 且未超重试上限（或 force）→ 重置回 queued
+    - 每用户同时最多 1 个进行中任务（queued/processing 各算 1 个）
+    """
+    target_lang = (req.target_lang or "zh").strip().lower() or "zh"
+    page_id = (req.page_id or "").strip()[:128]
+    image_url = (req.image_url or "").strip()
+    if not page_id:
+        raise HTTPException(status_code=400, detail="page_id 不能为空")
+    if not image_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="image_url 必须是 http(s) 公网地址（请先上传对象存储）")
+
+    task = (
+        db.query(TranslationTask)
+        .filter(
+            TranslationTask.comic_id == req.comic_id,
+            TranslationTask.page_id == page_id,
+            TranslationTask.target_lang == target_lang,
+        )
+        .first()
+    )
+    if task is not None:
+        if task.status == "done" and not req.force:
+            result = []
+            try:
+                result = json.loads(task.result_json or "[]")
+            except Exception:
+                result = []
+            return {"task_id": task.id, "status": "done", "result": result}
+        if task.status in ("queued", "processing") and not req.force:
+            return {"task_id": task.id, "status": task.status}
+        if task.status == "failed" and task.attempts >= TASK_MAX_ATTEMPTS and not req.force:
+            return {"task_id": task.id, "status": "failed", "error": task.error}
+        # failed 未超限（或 force / 对 done 强制重跑）→ 重置排队
+        task.status = "queued"
+        task.error = None
+        if req.force:
+            task.attempts = 0
+        task.image_url = image_url  # 图片可能换源（重新上传）
+        task.lang = (req.lang or "en").strip().lower() or "en"
+        db.commit()
+        db.refresh(task)
+        return {"task_id": task.id, "status": "queued"}
+
+    # 新任务：每用户同时最多 1 个进行中（queued/processing 都算）
+    busy = (
+        db.query(TranslationTask)
+        .filter(
+            TranslationTask.user_id == user.id,
+            TranslationTask.status.in_(("queued", "processing")),
+        )
+        .first()
+    )
+    if busy is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"你有一个翻译任务进行中（任务 #{busy.id}），完成后再提交新任务",
+        )
+    task = TranslationTask(
+        comic_id=req.comic_id,
+        page_id=page_id,
+        target_lang=target_lang,
+        lang=(req.lang or "en").strip().lower() or "en",
+        image_url=image_url,
+        status="queued",
+        user_id=user.id,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return {"task_id": task.id, "status": "queued"}
+
+
+@app.get("/api/translate/tasks/{task_id}")
+def get_translation_task(task_id: int, db: Session = Depends(get_db)):
+    """轮询任务状态：done 时带完整结果，failed 时带错误信息。"""
+    task = db.query(TranslationTask).filter(TranslationTask.id == task_id).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    resp: dict = {
+        "task_id": task.id,
+        "status": task.status,
+        "attempts": task.attempts,
+    }
+    if task.status == "done":
+        try:
+            resp["result"] = json.loads(task.result_json or "[]")
+        except Exception:
+            resp["result"] = []
+    if task.status == "failed":
+        resp["error"] = task.error
+    return resp
 
 
 # 启动时后台预热 OCR 模型（加载常驻内存，避免首个用户请求承担模型加载等待）。
@@ -622,6 +772,29 @@ def _warmup_ocr_on_startup() -> None:
             print(f"[warmup] OCR 预热线程异常（不影响服务）: {type(exc).__name__}: {exc}")
 
     threading.Thread(target=_run, daemon=True, name="ocr-warmup").start()
+
+
+@app.on_event("startup")
+def _start_translation_worker_on_startup() -> None:
+    """启动异步翻译队列 worker（全局唯一，单线程串行消费）。
+
+    崩溃/重启恢复：上次遗留的 processing 任务重置回 queued 重新排队
+    （attempts 已计数，超限任务不会被无限重跑）。
+    """
+    reset = 0
+    try:
+        with SessionLocal() as db:
+            reset = (
+                db.query(TranslationTask)
+                .filter(TranslationTask.status == "processing")
+                .update({"status": "queued"}, synchronize_session=False)
+            )
+            db.commit()
+        if reset:
+            print(f"[worker] 已把 {reset} 个中断的 processing 任务重置回 queued")
+    except Exception as exc:
+        print(f"[worker] 恢复中断任务失败（不影响启动）: {type(exc).__name__}: {exc}")
+    start_translation_worker()
 
 
 @app.get("/api/health")

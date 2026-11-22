@@ -19,6 +19,7 @@ import { type Comic } from "@/data/mockData";
 import { saveReadingProgress } from "@/lib/reading-history";
 
 import { API_BASE } from "@/lib/api";
+import { getToken } from "@/lib/auth";
 
 /** 后端 GET /api/comics/{id} 返回的数据结构 */
 interface ApiComicDetail {
@@ -279,8 +280,13 @@ export default function ComicReadPage({
   const hasEmptyPage = successEntries.some(([i]) => (translations[Number(i)] ?? []).length === 0);
   const hasTranslation = Object.keys(translations).length > 0;
 
-  /** 单页翻译请求：force=true 时让后端清掉该页旧缓存重跑；失败标记 error 而不是静默回 idle */
-  const translateOnePage = async (
+  /**
+   * 单页翻译：幂等提交任务（POST /api/translate/tasks）→ 轮询状态直到终态。
+   * 后端幂等键 comic_id+page_id+target_lang：已 done 直接返回结果；
+   * queued/processing 返回同一 task_id 绝不重复执行；failed 未超限自动重置排队。
+   * 前端一次只持有 1 个进行中任务（与后端「每用户最多 1 个进行中」对齐），逐页串行流水线。
+   */
+  const runTaskForPage = async (
     src: string,
     i: number,
     force: boolean
@@ -288,25 +294,71 @@ export default function ComicReadPage({
     setPageStatus((prev) => ({ ...prev, [i]: "loading" }));
     pageStartRef.current[i] = Date.now();
     try {
-      const res = await fetch(`${API_BASE}/api/translate`, {
+      const token = getToken();
+      if (!token) {
+        setPageStatus((prev) => ({ ...prev, [i]: "error" }));
+        setToastMsg("请先登录后再使用 AI 翻译");
+        setTimeout(() => setToastMsg(null), 2200);
+        return false;
+      }
+      const res = await fetch(`${API_BASE}/api/translate/tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // BYOK：带上用户自己保存的 Key（为空时后端自动降级服务器 Key）
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({
+          comic_id: Number(comic?.id) || 0,
+          page_id: `${chapter?.id ?? ""}:${i}`,
           image_url: src,
           lang: "en",
-          api_key: savedKey.trim(),
+          target_lang: "zh",
           force,
         }),
       });
       const data = await res.json().catch(() => null);
-      if (res.ok && Array.isArray(data)) {
-        setTranslations((prev) => ({ ...prev, [i]: data as TranslateBubble[] }));
+      if (!res.ok || !data?.task_id) {
+        setPageStatus((prev) => ({ ...prev, [i]: "error" }));
+        setToastMsg(data?.detail ?? "任务提交失败");
+        setTimeout(() => setToastMsg(null), 2500);
+        return false;
+      }
+      // 已完成：直接拿到结果（幂等命中），无需轮询
+      if (data.status === "done" && Array.isArray(data.result)) {
+        setTranslations((prev) => ({ ...prev, [i]: data.result as TranslateBubble[] }));
         setPageStatus((prev) => ({ ...prev, [i]: "success" }));
         return true;
       }
-      setPageStatus((prev) => ({ ...prev, [i]: "error" }));
-      return false;
+      if (data.status === "failed") {
+        setPageStatus((prev) => ({ ...prev, [i]: "error" }));
+        return false;
+      }
+      // queued / processing → 每 2 秒轮询一次，直到 done/failed
+      const taskId: number = data.task_id;
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const poll = await fetch(`${API_BASE}/api/translate/tasks/${taskId}`);
+        const pd = await poll.json().catch(() => null);
+        if (!poll.ok || !pd?.status) {
+          setPageStatus((prev) => ({ ...prev, [i]: "error" }));
+          return false;
+        }
+        if (pd.status === "done") {
+          setTranslations((prev) => ({
+            ...prev,
+            [i]: (pd.result ?? []) as TranslateBubble[],
+          }));
+          setPageStatus((prev) => ({ ...prev, [i]: "success" }));
+          return true;
+        }
+        if (pd.status === "failed") {
+          setPageStatus((prev) => ({ ...prev, [i]: "error" }));
+          setToastMsg(pd.error ?? "翻译失败");
+          setTimeout(() => setToastMsg(null), 2200);
+          return false;
+        }
+        // queued / processing → 继续轮询；超过 2 分钟页面右上角出现「重新翻译」
+      }
     } catch {
       setPageStatus((prev) => ({ ...prev, [i]: "error" }));
       return false;
@@ -328,22 +380,18 @@ export default function ComicReadPage({
     setIsTranslateDrawerOpen(false);
     setShowTranslated(true); // 立即切到译文模式：先完成的页面马上展示气泡
 
-    // 重新翻译：先清空旧的译文与状态，后端缓存也由 force 同步清除，重新保存全新结果
+    // 重新翻译：先清空旧的译文与状态，后端 force 会重置任务重跑
     if (force) {
       setTranslations({});
       setPageStatus({});
     }
 
-    // 分批并发（每批 3 页）：后端 OCR 推理有信号量限流，全量并发会让排队页 503 失败；
-    // 小批次压满限流额度即可，失败率最低，先返回的页面依然先渲染
-    const BATCH = 3;
+    // 串行流水线：每用户同时只有 1 个进行中任务，页 i 完成后立即提交页 i+1，
+    // 后端单 worker 按用户轮转调度，先完成的页面先渲染
     let okCount = 0;
-    for (let start = 0; start < pages.length; start += BATCH) {
-      const batch = pages
-        .slice(start, start + BATCH)
-        .map((src, k) => translateOnePage(src, start + k, force));
-      const results = await Promise.all(batch);
-      okCount += results.filter(Boolean).length;
+    for (let i = 0; i < pages.length; i++) {
+      const ok = await runTaskForPage(pages[i], i, force);
+      if (ok) okCount++;
     }
 
     setToastMsg(
@@ -365,7 +413,7 @@ export default function ComicReadPage({
       delete next[i];
       return next;
     });
-    const ok = await translateOnePage(src, i, true);
+    const ok = await runTaskForPage(src, i, true);
     setToastMsg(
       ok
         ? `第 ${i + 1} 页翻译完成`

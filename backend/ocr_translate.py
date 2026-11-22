@@ -1107,3 +1107,255 @@ async def ocr_batch(request: Request):
     success = sum(1 for r in results if r["ok"])
     print(f"[ocr-batch] 批次完成：{success}/{len(urls)} 张成功（lang={lang}）")
     return {"lang": lang, "total": len(urls), "success": success, "results": results}
+
+
+# ===== 异步翻译任务队列（单 worker 串行，禁止并发 OCR）=====
+# 由 main.py 的 TranslationTask 表充当队列；worker 逻辑聚合在本模块。
+
+# 首次执行 + 最多 2 次重试 = 共 3 次尝试，超过即 failed 终态
+TASK_MAX_ATTEMPTS = 3
+# LLM 翻译小批量：OCR 之后按批串行翻译，避免一次大 payload 超时
+TRANSLATE_BATCH_SIZE = 5
+# 队列空转轮询间隔（秒）
+_WORKER_IDLE_SLEEP = 1.5
+
+_rr_last_user: Optional[int] = None  # 用户轮转游标：记录上一个被调度的用户
+_rr_lock = threading.Lock()
+
+
+def _llm_translate_serial(
+    texts: list[str], user_api_key: str = "", batch_size: int = TRANSLATE_BATCH_SIZE
+) -> Optional[list[str]]:
+    """OCR 之后小批量串行翻译：按 batch_size 切片逐批调 LLM，批间不并发。
+
+    每批沿用 _llm_translate 的中文校验 + 温度重试；任何一批失败 → 整页失败（返回 None），
+    绝不写入部分结果。返回与输入等长的完整译文数组。
+    """
+    out: list[str] = []
+    for start in range(0, len(texts), batch_size):
+        chunk = texts[start : start + batch_size]
+        translated = _llm_translate(chunk, user_api_key)
+        if translated is None:
+            print(
+                f"[task] 小批量翻译第 {start // batch_size + 1} 批（{len(chunk)} 条）失败，整页放弃"
+            )
+            return None
+        out.extend(translated)
+    return out
+
+
+def pick_next_task(db):
+    """按用户轮转（round-robin）取下一个 queued 任务，保证多用户公平。
+
+    - queued 任务按 created_at 升序分组到各用户名下（每用户取最旧的一个）
+    - 全局游标 _rr_last_user 记录上次调度的用户，本次从它的下一位用户开始转
+    - 取到即标记 processing（由调用方 commit），天然防止重复取
+    返回任务对象或 None。"""
+    global _rr_last_user
+    from sqlalchemy import asc
+
+    TranslationTask = _load_task_model()
+    rows = (
+        db.query(TranslationTask)
+        .filter(TranslationTask.status == "queued")
+        .order_by(asc(TranslationTask.created_at), asc(TranslationTask.id))
+        .all()
+    )
+    if not rows:
+        return None
+
+    with _rr_lock:
+        # 按用户分组保序（created_at 升序）
+        by_user: dict = {}
+        for r in rows:
+            by_user.setdefault(r.user_id, []).append(r)
+        users = list(by_user)
+        start = 0
+        if _rr_last_user in users:
+            start = (users.index(_rr_last_user) + 1) % len(users)
+        ordered = users[start:] + users[:start]
+        chosen_user = ordered[0]
+        chosen = by_user[chosen_user][0]
+        _rr_last_user = chosen_user
+    chosen.status = "processing"
+    return chosen
+
+
+def _load_task_model():
+    """延迟加载 main.TranslationTask（避免模块加载期循环导入）。"""
+    from main import TranslationTask
+
+    return TranslationTask
+
+
+def run_translation_task(task_id: int) -> None:
+    """执行单个翻译任务：下载 → OCR → 小批量串行翻译 → 译文回写 result_json。
+
+    - 每页处理完（成功或失败）立即 del + gc.collect() 释放内存
+    - 失败 attempts+1：未超 TASK_MAX_ATTEMPTS 重置回 queued 等下轮，超限记 failed
+    - 执行前查 TranslationCache，同图已有合规中文结果直接 done（省 OCR 与额度）
+    """
+    from main import SessionLocal, TranslationTask
+
+    task_lang = "en"
+    task_url = ""
+    task_force = False
+
+    def _finish(status: str, result_json: Optional[str] = None, error: Optional[str] = None):
+        """终态回写（独立 session，避免长事务占用连接）。"""
+        db2 = SessionLocal()
+        try:
+            t = db2.query(TranslationTask).filter(TranslationTask.id == task_id).first()
+            if t is None:
+                return
+            t.status = status
+            if result_json is not None:
+                t.result_json = result_json
+            t.error = error
+            db2.commit()
+        finally:
+            db2.close()
+
+    db = SessionLocal()
+    try:
+        task = db.query(TranslationTask).filter(TranslationTask.id == task_id).first()
+        if task is None:
+            return
+        task.status = "processing"
+        task.error = None
+        task.attempts = (task.attempts or 0) + 1
+        db.commit()
+        task_lang = task.lang or "en"
+        task_url = task.image_url
+    finally:
+        db.close()
+
+    img_bytes: Optional[bytes] = None
+    img = None
+    try:
+        img_bytes = _fetch_image_bytes(task_url)
+        img = _decode_image(img_bytes)
+        img_h, img_w = img.shape[:2]
+
+        # 缓存直取：同图已有合规中文译文 → 不再跑 OCR 与大模型
+        cache_key = hashlib.sha256(img_bytes).hexdigest()
+        cached_json = _cache_get(cache_key)
+        if cached_json:
+            try:
+                cached_rows = json.loads(cached_json)
+                if isinstance(cached_rows, list) and _result_all_chinese(cached_rows):
+                    print(f"[task] #{task_id} 缓存命中 hash={cache_key[:16]}…，直接完成")
+                    _finish("done", cached_json)
+                    return
+            except Exception:
+                pass
+
+        ocr = _get_ocr(task_lang)
+        # 信号量保护：worker 串行是常态，但与旧同步接口 /api/translate 共存时防并发推理
+        acquired = _ocr_semaphore.acquire(timeout=_OCR_QUEUE_TIMEOUT)
+        if not acquired:
+            raise RuntimeError(f"OCR 排队超时（{_OCR_QUEUE_TIMEOUT}s）")
+        try:
+            raw = ocr.predict(img)
+        finally:
+            _ocr_semaphore.release()
+
+        items = _parse_ocr_result(raw)
+        items = _filter_items(items, img)
+        items = _merge_bubble_lines(items) if items else []
+
+        if not items:
+            # 图片本身无文字 → 空数组也是合法完成态
+            _cache_put(cache_key, task_url, [])
+            _finish("done", "[]")
+            print(f"[task] #{task_id} 未识别到文字（{img_w}x{img_h}），空结果完成")
+            return
+
+        texts = [it["text"] for it in items]
+        print(f"[task] #{task_id} OCR 完成 {len(items)} 个气泡，开始小批量串行翻译")
+        translated = _llm_translate_serial(texts, user_api_key="")
+        if translated is None:
+            raise RuntimeError("LLM 翻译未获得合规中文译文（密钥未配置或模型超时）")
+
+        result = [
+            {
+                "box": it["box"],
+                "bg_color": _bubble_bg_color(img, it["box"]),
+                "original": it["text"],
+                "translated": translated[i],
+            }
+            for i, it in enumerate(items)
+        ]
+        result_json = json.dumps(result, ensure_ascii=False)
+        _cache_put(cache_key, task_url, result)
+        _finish("done", result_json)
+        print(f"[task] #{task_id} 完成：{len(result)} 条气泡已回写 result_json")
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        print(f"[task] #{task_id} 执行失败: {error_msg}")
+        # 重试判定：本次是第 attempts 次；attempts < 上限 → 回队列，否则 failed 终态
+        db3 = SessionLocal()
+        try:
+            t = db3.query(TranslationTask).filter(TranslationTask.id == task_id).first()
+            if t is not None:
+                if (t.attempts or 0) < TASK_MAX_ATTEMPTS:
+                    t.status = "queued"
+                    t.error = error_msg
+                    print(f"[task] #{task_id} 将重试（第 {t.attempts}/{TASK_MAX_ATTEMPTS} 次）")
+                else:
+                    t.status = "failed"
+                    t.error = error_msg
+                    print(f"[task] #{task_id} 重试耗尽，标记 failed")
+                db3.commit()
+        finally:
+            db3.close()
+    finally:
+        # 单页处理结束：彻底释放内存
+        img = None
+        img_bytes = None
+        gc.collect()
+
+
+def _worker_tick() -> bool:
+    """worker 单轮：轮转取一个 queued 任务并串行执行。取到并执行返回 True。"""
+    from main import SessionLocal
+
+    db = SessionLocal()
+    task_id: Optional[int] = None
+    try:
+        chosen = pick_next_task(db)
+        if chosen is None:
+            return False
+        db.commit()
+        task_id = chosen.id
+    finally:
+        db.close()
+    if task_id is not None:
+        run_translation_task(task_id)
+        return True
+    return False
+
+
+def _worker_loop() -> None:
+    """单 worker 主循环：串行消费数据库队列，空队列时小睡。绝不并发跑 OCR。"""
+    print("[worker] 翻译任务 worker 已启动（单线程串行模式）")
+    while True:
+        try:
+            executed = _worker_tick()
+        except Exception as exc:
+            print(f"[worker] 单轮异常（继续下一轮）: {type(exc).__name__}: {exc}")
+            executed = False
+        if not executed:
+            time.sleep(_WORKER_IDLE_SLEEP)
+
+
+def start_translation_worker() -> None:
+    """启动唯一的队列 worker（幂等：重复调用只起一个线程）。"""
+    global _worker_started
+    if _worker_started:
+        return
+    _worker_started = True
+    threading.Thread(target=_worker_loop, daemon=True, name="translate-worker").start()
+
+
+_worker_started = False
