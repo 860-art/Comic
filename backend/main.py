@@ -34,6 +34,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     inspect,
+    or_,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -1402,8 +1403,14 @@ def update_me(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """更新当前登录用户的资料：只更新前端传入的字段，写回数据库。"""
+    """更新当前登录用户的资料：只更新前端传入的字段，写回数据库。
+
+    换头像/背景时旧图立即从 R2 清理（仅限本站对象存储的 URL，
+    且该用户其余数据不再引用它），避免对象存储堆积废弃图片。
+    """
     updated = req.model_dump(exclude_unset=True)
+    # 记录换图前的旧 URL（仅头像/背景这两个字段参与清理）
+    old_urls = {f: getattr(user, f) for f in ("avatar_url", "cover_url") if f in updated}
     for field, value in updated.items():
         # tags 是数组 → 入库前序列化为 JSON 字符串
         if field == "tags" and value is not None:
@@ -1412,6 +1419,14 @@ def update_me(
             setattr(user, field, value)
     db.commit()
     db.refresh(user)
+
+    # 旧图清理：URL 真的变了才清；外链 / data:URL / 仍被其他数据引用的不清
+    for field, old in old_urls.items():
+        if not old or old == updated.get(field):
+            continue
+        key = _r2_object_key(old)
+        if key and not _url_still_referenced(db, user.id, old):
+            _delete_r2_object_quietly(key)
     return {"message": "资料已保存", "user": user_profile(user)}
 
 
@@ -1453,6 +1468,57 @@ def _get_r2_client():
             region_name="auto",
         )
     return _r2_client
+
+
+def _r2_object_key(url: str | None) -> str | None:
+    """本站对象存储的公网 URL → 对象键（uploads/...）；外链 / data:URL 返回 None。"""
+    if not url or not R2_PUBLIC_BASE:
+        return None
+    if not url.startswith(R2_PUBLIC_BASE + "/"):
+        return None
+    return url[len(R2_PUBLIC_BASE) + 1 :]
+
+
+def _delete_r2_object_quietly(key: str) -> None:
+    """删除 R2 对象；失败只打日志不抛错（清理是附带动作，不能阻塞主流程）。"""
+    try:
+        _get_r2_client().delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+        print(f"[r2] 已清理旧对象 {key}")
+    except Exception as exc:
+        print(f"[r2] 清理旧对象失败 {key}: {type(exc).__name__}: {exc}")
+
+
+def _url_still_referenced(db: Session, user_id: int, url: str) -> bool:
+    """该用户的其他数据是否仍引用该 URL（防止换头像误删正在展示的帖子配图）。
+
+    检查范围：帖子配图（image_url / image_urls）、正式漫画封面、待审投稿封面与内页。
+    URL 含 uuid 不可预测，跨用户引用实际不可能发生，因此只查本用户的行。
+    """
+    if (
+        db.query(Post)
+        .filter(
+            Post.author_id == user_id,
+            or_(Post.image_url == url, Post.image_urls.contains(url)),
+        )
+        .first()
+    ):
+        return True
+    if (
+        db.query(Comic)
+        .filter(Comic.submitter_id == user_id, Comic.cover_image == url)
+        .first()
+    ):
+        return True
+    if (
+        db.query(PendingComic)
+        .filter(
+            PendingComic.submitter_id == user_id,
+            or_(PendingComic.cover_url == url, PendingComic.chapters.contains(url)),
+        )
+        .first()
+    ):
+        return True
+    return False
 
 
 @app.post("/api/upload")
