@@ -137,7 +137,8 @@ function FeedView({
 }) {
   const router = useRouter();
   const [liked, setLiked] = useState(false);
-  const [toast, setToast] = useState(false);
+  // Toast 消息内容：点赞/评论的成功与错误提示都走这里（此前文案被硬编码成"未登录"，导致点赞成功也误报）
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [carouselPage, setCarouselPage] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
   // 关注状态：挂载时从 localStorage('follows') 恢复；粉丝数 = 基础数 + (已关注 ? 1 : 0)
@@ -184,11 +185,11 @@ function FeedView({
     };
   }, []);
 
-  // 屏幕正中玻璃态 Toast，2 秒后自动消失
+  // 屏幕正中玻璃态 Toast，2 秒后自动消失（文案跟随传入的消息）
   const showToast = (msg: string) => {
-    setToast(true);
+    setToastMsg(msg);
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(false), 2000);
+    toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
   };
 
   // 核心交互：点赞 → 调后端 POST /api/posts/{id}/like（真实 +1 并给作者产生通知）
@@ -503,10 +504,10 @@ function FeedView({
         onPublish={handlePublish}
       />
 
-      {/* 屏幕正中玻璃态 Toast（未登录提示），2 秒后自动消失 */}
-      {toast && (
+      {/* 屏幕正中玻璃态 Toast（点赞/评论结果提示），2 秒后自动消失 */}
+      {toastMsg && (
         <div className="fixed left-1/2 top-1/2 z-[100] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-white/20 bg-black/60 px-6 py-3 text-white backdrop-blur-xl">
-          未登录
+          {toastMsg}
         </div>
       )}
     </div>
