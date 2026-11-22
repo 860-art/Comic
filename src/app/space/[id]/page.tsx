@@ -339,9 +339,17 @@ export default function OtherSpacePage() {
     setComments([]);
     setCommentsLoading(true);
     fetch(`${API_BASE}/api/posts/${post.id.slice(3)}/comments`)
-      .then((r) => (r.ok ? r.json() : []))
+      .then((r) => {
+        if (!r.ok) throw new Error("评论接口不可用（后端版本落后）");
+        return r.json();
+      })
       .then((list: ApiComment[]) => setComments(list.map(apiCommentToItem)))
-      .catch(() => {})
+      .catch(() => {
+        // 后端还没更新到评论读取接口时，兜底显示浏览器本地已发的评论
+        const local = loadLocalComments(post.id);
+        if (local.length > 0) setComments(local);
+        else showToast("评论加载失败，请更新服务器后端");
+      })
       .finally(() => setCommentsLoading(false));
   };
 
@@ -407,18 +415,21 @@ export default function OtherSpacePage() {
         return false;
       }
       const n = data.notification;
-      setComments((prev) => [
-        apiCommentToItem({
-          id: n.id,
-          actor_id: n.actor_id,
-          actor_username: n.actor_username,
-          actor_avatar: n.actor_avatar,
-          content: text,
-          image_url: n.image_url,
-          created_at: new Date().toISOString(),
-        }),
-        ...prev,
-      ]);
+      const item = apiCommentToItem({
+        id: n.id,
+        actor_id: n.actor_id,
+        actor_username: n.actor_username,
+        actor_avatar: n.actor_avatar,
+        content: text,
+        image_url: n.image_url,
+        created_at: new Date().toISOString(),
+      });
+      setComments((prev) => {
+        const next = [item, ...prev];
+        // 本地只作「兜底镜像」：后端评论接口不可用（旧版服务器）时仍能显示
+        saveLocalComments(drawerPost.id, next);
+        return next;
+      });
       setCommentCounts((prev) => ({
         ...prev,
         [drawerPost.id]: (prev[drawerPost.id] ?? 0) + 1,

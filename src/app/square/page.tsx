@@ -97,7 +97,34 @@ function BlurredBackground({ src }: { src?: string }) {
   );
 }
 
-/** 评论本地持久化：按帖子 ID 存取（后端暂无评论接口，先保证刷新不丢） */
+/** 后端 GET /api/posts/{id}/comments 返回的单条评论 */
+interface ApiCommentRow {
+  id: number;
+  actor_id: number;
+  actor_username: string;
+  actor_avatar?: string | null;
+  content: string;
+  image_url?: string | null;
+  created_at: string;
+}
+
+const COMMENT_COLORS = ["bg-violet-500", "bg-sky-500", "bg-emerald-500", "bg-amber-500", "bg-rose-500"];
+
+function toCommentItem(c: ApiCommentRow): CommentItem {
+  return {
+    id: `c-${c.id}`,
+    author: c.actor_username,
+    avatar: c.actor_avatar || undefined,
+    color: COMMENT_COLORS[c.id % COMMENT_COLORS.length],
+    time: formatTime(c.created_at),
+    content: c.content,
+    image: c.image_url || undefined,
+    likes: 0,
+    replies: [],
+  };
+}
+
+/** 评论本地持久化：仅用于本地种子帖子（真实帖子统一走后端评论接口） */
 const COMMENTS_KEY = "sq_post_comments";
 
 function loadPostComments(postId: string): CommentItem[] {
@@ -183,13 +210,38 @@ function FeedView({
 
   // 头像/名字 → 跳转对应空间（自己 → /space，他人 → /space/[id]）
   const openAuthorSpace = () => router.push(getSpaceHref(post.authorId));
-  // 评论列表：按帖存储——初始从本地评论库恢复（新帖子为空数组，绝无假评论）
+  // 评论列表：真实帖子统一从后端 GET /api/posts/{id}/comments 读取，
+  // 与漫画详情页/他人空间页共用同一数据源（本地库只用于本地种子帖子）
   const [commentsList, setCommentsList] = useState<CommentItem[]>(
-    loadPostComments(post.id)
+    post.id.startsWith("db-") ? [] : loadPostComments(post.id)
   );
+  const [commentsLoading, setCommentsLoading] = useState(false);
 
   useEffect(() => {
-    setCommentsList(loadPostComments(post.id));
+    if (!post.id.startsWith("db-")) {
+      setCommentsList(loadPostComments(post.id));
+      return;
+    }
+    let alive = true;
+    setCommentsLoading(true);
+    fetch(`${API_BASE}/api/posts/${post.id.slice(3)}/comments`)
+      .then((r) => {
+        if (!r.ok) throw new Error("评论接口不可用（后端版本落后）");
+        return r.json();
+      })
+      .then((rows: ApiCommentRow[]) => {
+        if (alive) setCommentsList(rows.map(toCommentItem));
+      })
+      .catch(() => {
+        // 后端还没更新到评论读取接口时，兜底显示浏览器里已发的本地评论
+        if (alive) setCommentsList(loadPostComments(post.id));
+      })
+      .finally(() => {
+        if (alive) setCommentsLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
   }, [post.id]);
   // 评论点赞状态：id -> 是否已点赞
   const [likedComments, setLikedComments] = useState<Record<string, boolean>>({});
@@ -299,7 +351,7 @@ function FeedView({
         ...commentsList,
       ];
       setCommentsList(newList);
-      // 持久化到本地按帖评论库，刷新不丢失
+      // 本地只作「兜底镜像」：后端评论接口不可用时才读它，正常情况一律以后端为准
       savePostComments(post.id, newList);
       return true;
     } catch (err) {
@@ -528,6 +580,7 @@ function FeedView({
         onClose={() => setDrawerOpen(false)}
         post={post}
         comments={commentsList}
+        loading={commentsLoading}
         likedComments={likedComments}
         onToggleLike={toggleCommentLike}
         onPublish={handlePublish}
