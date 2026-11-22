@@ -1199,10 +1199,10 @@ def run_translation_task(task_id: int) -> None:
 
     task_lang = "en"
     task_url = ""
-    task_force = False
+    task_api_key = ""
 
     def _finish(status: str, result_json: Optional[str] = None, error: Optional[str] = None):
-        """终态回写（独立 session，避免长事务占用连接）。"""
+        """终态回写（独立 session，避免长事务占用连接）；同时清除暂存的 BYOK 密钥。"""
         db2 = SessionLocal()
         try:
             t = db2.query(TranslationTask).filter(TranslationTask.id == task_id).first()
@@ -1212,6 +1212,7 @@ def run_translation_task(task_id: int) -> None:
             if result_json is not None:
                 t.result_json = result_json
             t.error = error
+            t.api_key = None  # 用完即清：密钥不长期留在数据库
             db2.commit()
         finally:
             db2.close()
@@ -1227,6 +1228,7 @@ def run_translation_task(task_id: int) -> None:
         db.commit()
         task_lang = task.lang or "en"
         task_url = task.image_url
+        task_api_key = (task.api_key or "").strip()
     finally:
         db.close()
 
@@ -1237,13 +1239,19 @@ def run_translation_task(task_id: int) -> None:
         img = _decode_image(img_bytes)
         img_h, img_w = img.shape[:2]
 
-        # 缓存直取：同图已有合规中文译文 → 不再跑 OCR 与大模型
+        # 缓存直取：同图已有【非空】合规中文译文 → 不再跑 OCR 与大模型。
+        # 空数组缓存（上次 OCR 漏检 / 无文字页）不直接复用：重新识别一次，
+        # 避免一次漏检（换模型参数、压缩画质波动）被永久缓存、重新翻译也无效。
         cache_key = hashlib.sha256(img_bytes).hexdigest()
         cached_json = _cache_get(cache_key)
         if cached_json:
             try:
                 cached_rows = json.loads(cached_json)
-                if isinstance(cached_rows, list) and _result_all_chinese(cached_rows):
+                if (
+                    isinstance(cached_rows, list)
+                    and cached_rows  # 非空才命中
+                    and _result_all_chinese(cached_rows)
+                ):
                     print(f"[task] #{task_id} 缓存命中 hash={cache_key[:16]}…，直接完成")
                     _finish("done", cached_json)
                     return
@@ -1265,17 +1273,34 @@ def run_translation_task(task_id: int) -> None:
         items = _merge_bubble_lines(items) if items else []
 
         if not items:
-            # 图片本身无文字 → 空数组也是合法完成态
-            _cache_put(cache_key, task_url, [])
+            # 图片本身无文字（或本次 OCR 漏检）→ 空数组是合法完成态，
+            # 但【不写缓存】：下次仍有机会重新识别，不被一次漏检永久锁死
             _finish("done", "[]")
-            print(f"[task] #{task_id} 未识别到文字（{img_w}x{img_h}），空结果完成")
+            print(f"[task] #{task_id} 未识别到文字（{img_w}x{img_h}），空结果完成（不写缓存）")
             return
 
         texts = [it["text"] for it in items]
-        print(f"[task] #{task_id} OCR 完成 {len(items)} 个气泡，开始小批量串行翻译")
-        translated = _llm_translate_serial(texts, user_api_key="")
+        print(
+            f"[task] #{task_id} OCR 完成 {len(items)} 个气泡，开始小批量串行翻译"
+            f"（BYOK={'有' if task_api_key else '无'}）"
+        )
+        translated = _llm_translate_serial(texts, user_api_key=task_api_key)
         if translated is None:
-            raise RuntimeError("LLM 翻译未获得合规中文译文（密钥未配置或模型超时）")
+            # 区分「根本没 Key」与「Key 有但调用/校验失败」，便于按日志快速定位
+            has_any_key = bool(
+                task_api_key
+                or os.getenv("ZHIPU_API_KEY", "").strip()
+                or os.getenv("DEEPSEEK_API_KEY", "").strip()
+            )
+            if not has_any_key:
+                raise RuntimeError(
+                    "翻译失败：未配置 API 密钥（前端未传 BYOK，服务器也未设置 "
+                    "ZHIPU_API_KEY / DEEPSEEK_API_KEY）"
+                )
+            raise RuntimeError(
+                "翻译失败：大模型调用失败或译文未通过中文校验"
+                "（Key 无效 / 额度不足 / 超时 / 返回了原文），详见服务器日志 [translate]"
+            )
 
         result = [
             {
@@ -1305,6 +1330,7 @@ def run_translation_task(task_id: int) -> None:
                 else:
                     t.status = "failed"
                     t.error = error_msg
+                    t.api_key = None  # 终态清除暂存密钥（queued 重试时仍需保留）
                     print(f"[task] #{task_id} 重试耗尽，标记 failed")
                 db3.commit()
         finally:

@@ -313,6 +313,8 @@ export default function ComicReadPage({
           image_url: src,
           lang: "en",
           target_lang: "zh",
+          // BYOK：把用户保存的 Key 随任务交给 worker（为空时服务器 Key 兜底）
+          api_key: savedKey.trim(),
           force,
         }),
       });
@@ -353,8 +355,17 @@ export default function ComicReadPage({
         }
         if (pd.status === "failed") {
           setPageStatus((prev) => ({ ...prev, [i]: "error" }));
-          setToastMsg(pd.error ?? "翻译失败");
-          setTimeout(() => setToastMsg(null), 2200);
+          // 后端技术错误 → 用户可操作的简短提示（不再把整串 RuntimeError 糊在画面上）
+          const raw = String(pd.error ?? "");
+          const hint = raw.includes("未配置 API 密钥")
+            ? "翻译失败：请先在「AI 密钥」里填写 API Key"
+            : raw.includes("大模型调用失败")
+              ? "翻译失败：API Key 无效 / 额度不足 / 超时，请检查后重试"
+              : raw.includes("OCR")
+                ? "翻译失败：图片识别异常，请点「重新翻译」重试"
+                : "翻译失败，请点右上角「重新翻译」重试";
+          setToastMsg(hint);
+          setTimeout(() => setToastMsg(null), 3000);
           return false;
         }
         // queued / processing → 继续轮询；超过 2 分钟页面右上角出现「重新翻译」

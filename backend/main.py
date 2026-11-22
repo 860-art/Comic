@@ -315,6 +315,9 @@ class TranslationTask(Base):
     # 完成后的完整结果（[{box, bg_color, original, translated}, ...]）
     result_json: Mapped[str | None] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text)
+    # 用户 BYOK 密钥（前端填的智谱 Key）：异步 worker 执行时需要它。
+    # 仅任务进行中暂存，进入 done/failed 终态时立即清空，日志永不输出明文。
+    api_key: Mapped[str | None] = mapped_column(Text)
     # 提交人：用于「每用户同时最多 1 个进行中任务」与调度轮转公平性
     user_id: Mapped[int] = mapped_column(Integer, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -411,6 +414,14 @@ if _inspector.has_table("comments"):
     with engine.begin() as _conn:
         if "image_url" not in _comment_cols:
             _conn.execute(text("ALTER TABLE comments ADD COLUMN image_url TEXT"))
+
+# 已部署过的服务器：translation_tasks 表缺 api_key（BYOK 密钥）列时自动补列
+# （create_all 不会给已存在的表加列，不补则 worker 查询直接报错）
+if _inspector.has_table("translation_tasks"):
+    _tt_cols = {col["name"] for col in _inspector.get_columns("translation_tasks")}
+    with engine.begin() as _conn:
+        if "api_key" not in _tt_cols:
+            _conn.execute(text("ALTER TABLE translation_tasks ADD COLUMN api_key TEXT"))
 
 # 旧版 notifications 表：post_id 为 NOT NULL（审核通知不属于帖子，需要可空）→ 重建表；
 # 同时补 is_read（未读红点）。SQLite 不支持改列约束，只能建新表搬数据。
@@ -647,6 +658,8 @@ class TranslationTaskRequest(BaseModel):
     lang: str = "en"
     # 目标语言（目前固定 zh）
     target_lang: str = "zh"
+    # BYOK：用户自己的智谱 API Key（为空时 worker 降级服务器环境变量 Key）
+    api_key: str = ""
     # force=true：done 任务也重置排队重跑（对应前端「重新翻译」）
     force: bool = False
 
@@ -667,6 +680,8 @@ def create_translation_task(
     target_lang = (req.target_lang or "zh").strip().lower() or "zh"
     page_id = (req.page_id or "").strip()[:128]
     image_url = (req.image_url or "").strip()
+    # BYOK：用户 Key 随任务暂存（worker 执行时用），为空则降级服务器环境变量 Key
+    api_key = (req.api_key or "").strip() or None
     if not page_id:
         raise HTTPException(status_code=400, detail="page_id 不能为空")
     if not image_url.startswith(("http://", "https://")):
@@ -689,17 +704,20 @@ def create_translation_task(
             except Exception:
                 result = []
             return {"task_id": task.id, "status": "done", "result": result}
-        if task.status in ("queued", "processing") and not req.force:
+        if task.status in ("queued", "processing"):
+            # 幂等：直接返回同一 task_id，绝不重复入队；顺手补上用户刚填的 Key
+            if api_key:
+                task.api_key = api_key
+                db.commit()
             return {"task_id": task.id, "status": task.status}
-        if task.status == "failed" and task.attempts >= TASK_MAX_ATTEMPTS and not req.force:
-            return {"task_id": task.id, "status": "failed", "error": task.error}
-        # failed 未超限（或 force / 对 done 强制重跑）→ 重置排队
+        # failed（或 force 重译 done）→ 用户主动重新提交即开启新一轮：
+        # attempts 归零，worker 内最多再自动重试 2 次（不会无限重试，也不会永久卡在报错页）
         task.status = "queued"
         task.error = None
-        if req.force:
-            task.attempts = 0
+        task.attempts = 0
         task.image_url = image_url  # 图片可能换源（重新上传）
         task.lang = (req.lang or "en").strip().lower() or "en"
+        task.api_key = api_key
         db.commit()
         db.refresh(task)
         return {"task_id": task.id, "status": "queued"}
@@ -726,6 +744,7 @@ def create_translation_task(
         image_url=image_url,
         status="queued",
         user_id=user.id,
+        api_key=api_key,
     )
     db.add(task)
     db.commit()
