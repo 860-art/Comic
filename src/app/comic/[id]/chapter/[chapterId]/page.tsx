@@ -556,8 +556,9 @@ export default function ComicReadPage({
         </div>
       </header>
 
-      {/* 漫画内容：真实内页图 / 占位画格 */}
-      <main className="mx-auto max-w-3xl space-y-2 px-4 py-6">
+      {/* 漫画内容：真实内页图 / 占位画格。
+          无缝阅读：去掉 space-y（页间零间隙）与 py（上下不留白），图片首尾紧贴 */}
+      <main className="mx-auto max-w-3xl px-4">
         {realImages && realImages.length > 0
           ? realImages.map((src, i) => {
               const size = imgSizes[i];
@@ -574,14 +575,14 @@ export default function ComicReadPage({
                     }}
                     src={src}
                     alt={`第 ${i + 1} 页`}
-                    className={`w-full rounded-lg transition-all duration-500 ${
+                    className={`block w-full transition-all duration-500 ${
                       status === "loading" ? "blur-sm" : ""
                     }`}
                     onLoad={() => handleImgLoad(i)}
                   />
                   {/* 毛玻璃占位：该页翻译中 → 黑色半透明遮罩 + 旋转图标 + 文案 */}
                   {status === "loading" && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2.5 rounded-lg bg-black/55 backdrop-blur-sm">
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2.5 bg-black/55 backdrop-blur-sm">
                       <Loader2 className="h-6 w-6 animate-spin text-white/90" />
                       <p className="text-xs tracking-wide text-white/80">
                         AI 汉化中<span className="animate-pulse">...</span>
@@ -637,7 +638,7 @@ export default function ComicReadPage({
           : placeholderPages.map((_, i) => (
               <div
                 key={i}
-                className={`flex aspect-[3/4] w-full items-center justify-center rounded-lg text-sm transition-all duration-700 ${
+                className={`flex aspect-[3/4] w-full items-center justify-center text-sm transition-all duration-700 ${
                   hasTranslation
                     ? "bg-emerald-950/60 text-emerald-200/70 grayscale"
                     : "bg-zinc-900 text-white/30"
