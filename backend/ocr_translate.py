@@ -55,10 +55,13 @@ MIN_MEANINGFUL_CHARS = 2     # 有效字符（去掉标点/空白后的字母数
 LONG_BANNER_MIN_CHARS = 8
 
 # ===== OCR 懒加载单例（按语言缓存；启动预热 + 首次调用兜底） =====
-# PaddleOCR 3.x 默认加载 PP-OCRv5 **Server** 模型（det ~85MB / rec ~90MB），
-# 2核4G 服务器内存吃紧且推理慢 → 中/英/日显式切换 Mobile 轻量模型（det ~5MB / rec ~16MB）。
-# 返回结构与 Server 版完全一致（rec_texts 等 dict），下游解析零改动。
-_MOBILE_DET = "PP-OCRv5_mobile_det"
+# PaddleOCR 3.x 返回结构各模型一致（rec_texts 等 dict），下游解析零改动。
+# 检测模型：mobile_det 对大号描边/渐变艺术字标题漏检明显（用户实测整行标题无气泡），
+# 升级 server_det（~85MB）显著提升检出率；现为一张一张串行翻译，内存可承受。
+# 环境变量 OCR_DET_MODEL=PP-OCRv5_mobile_det 可回退轻量模型（内存吃紧时）。
+OCR_DET_MODEL = os.getenv("OCR_DET_MODEL", "PP-OCRv5_server_det") or "PP-OCRv5_server_det"
+# 检测输入边长上限：960 → 1280（大图缩放更少，小字/复杂排版检出更稳）
+OCR_DET_SIDE_LEN = max(640, int(os.getenv("OCR_DET_SIDE_LEN", "1280") or "1280"))
 _MOBILE_REC = "PP-OCRv5_mobile_rec"          # 通用字典：中/英/日文假名
 _KOREAN_MOBILE_REC = "korean_PP-OCRv5_mobile_rec"  # 韩文专用轻量模型（通用字典不含韩文）
 
@@ -88,7 +91,7 @@ def _get_ocr(lang: str):
             # - rec_batch_num=1：识别批大小压到 1，内存峰值最低（漫画逐行识别足够）
             # - use_angle_cls=False：漫画文字固定正向，跳过方向分类省时省内存
             # - cpu_math_library_num_threads=2：CPU 数学库线程数对齐 2 核
-            # - det_limit_side_len=960：检测输入边长限制，大图先缩放，控内存与耗时
+            # - det_limit_side_len=OCR_DET_SIDE_LEN（默认 1280）：大图少缩放，检出更稳
             tuned_kwargs = dict(
                 lang=lang,
                 use_doc_orientation_classify=False,
@@ -98,7 +101,7 @@ def _get_ocr(lang: str):
                 rec_batch_num=1,
                 use_angle_cls=False,
                 cpu_math_library_num_threads=2,
-                det_limit_side_len=960,
+                det_limit_side_len=OCR_DET_SIDE_LEN,
             )
             # 兜底安全配置：调优参数在当前 paddle 版本不可用（初始化报错）时回退，
             # mkldnn 关闭走纯 CPU 算子（paddle 3.3.1 onednn 存在兼容 bug 的场景）
@@ -113,13 +116,13 @@ def _get_ocr(lang: str):
                 if lang == "korean":
                     # 韩文：两个模型名都显式指定（lang 此时会被忽略，不能依赖它选 rec）
                     _ocr_instances[lang] = PaddleOCR(
-                        text_detection_model_name=_MOBILE_DET,
+                        text_detection_model_name=OCR_DET_MODEL,
                         text_recognition_model_name=_KOREAN_MOBILE_REC,
                         **tuned_kwargs,
                     )
                 else:
                     _ocr_instances[lang] = PaddleOCR(
-                        text_detection_model_name=_MOBILE_DET,
+                        text_detection_model_name=OCR_DET_MODEL,
                         text_recognition_model_name=_MOBILE_REC,
                         **tuned_kwargs,
                     )
@@ -129,13 +132,13 @@ def _get_ocr(lang: str):
                 try:
                     if lang == "korean":
                         _ocr_instances[lang] = PaddleOCR(
-                            text_detection_model_name=_MOBILE_DET,
+                            text_detection_model_name=OCR_DET_MODEL,
                             text_recognition_model_name=_KOREAN_MOBILE_REC,
                             **safe_kwargs,
                         )
                     else:
                         _ocr_instances[lang] = PaddleOCR(
-                            text_detection_model_name=_MOBILE_DET,
+                            text_detection_model_name=OCR_DET_MODEL,
                             text_recognition_model_name=_MOBILE_REC,
                             **safe_kwargs,
                         )
@@ -379,13 +382,18 @@ def _build_translated_bubble(img: np.ndarray, item: dict, translated_text: str) 
     }
 
 
-# ===== 同气泡行合并：把同一气泡里上下贴近的多行小框合并成一个大气泡框 =====
-# 判定条件（满足全部才算同一气泡）：
-#   1. X 轴相近：两框中心点水平距离 < 较宽框宽度的 50%
-#      （居中对齐的短行与左对齐的长行都能并上，即使 X 重叠很少）
-MERGE_X_CENTER_TOLERANCE = 0.5
-#   2. Y 轴很近：垂直间距 < 较矮框高度的 50%（气泡内相邻行距；气泡间空隙远大于此）
-MERGE_Y_GAP_RATIO = 0.5
+# ===== 同气泡行合并：把同一气泡/同一段落里上下贴近的多行小框合并成一个框 =====
+# 判定条件（满足全部才算同一段）：
+#   1. X 轴相近：两框中心点水平距离 < 较宽框宽度的 60%，或两框水平重叠率 > 40%
+#      （居中/左对齐/右对齐的行都能并上）
+#   2. Y 轴间距 < 较矮框高度 × 1.5 —— 漫画旁白行距普遍大于气泡内行距，
+#      0.5 的旧阈值导致同一段话被拆成多个独立翻译框（用户看到的"间隔"）
+MERGE_X_CENTER_TOLERANCE = 0.6
+MERGE_Y_GAP_RATIO = 1.5
+# 水平重叠率下限：overlap = 交集宽 / 较窄框宽，超过即视为同段（X 中心判定的补充）
+MERGE_X_OVERLAP_RATIO = 0.4
+# 防误并保险：一组最多 5 行，避免整页旁白全部串成一句
+MERGE_MAX_LINES_PER_GROUP = 5
 
 
 def _group_bbox(group: list[dict]) -> list[int]:
@@ -399,14 +407,21 @@ def _group_bbox(group: list[dict]) -> list[int]:
 
 
 def _can_merge(g1: list[dict], g2: list[dict]) -> bool:
-    """两组框是否属于同一气泡：X 轴中心点相近 且 Y 轴距离很近。"""
+    """两组框是否属于同一段：X 轴相近（中心或重叠）且 Y 轴间距不大。"""
+    # 防误并保险：合并后超过行数上限的组永不合并
+    if len(g1) + len(g2) > MERGE_MAX_LINES_PER_GROUP:
+        return False
     x1, y1, w1, h1 = _group_bbox(g1)
     x2, y2, w2, h2 = _group_bbox(g2)
-    # 1) X 轴中心点相近（差值 < 较宽框宽度 × MERGE_X_CENTER_TOLERANCE）
+    # 1) X 轴相近：中心点距离 < 较宽框宽度 × 容差，或水平重叠率足够大
     cx1, cx2 = x1 + w1 / 2, x2 + w2 / 2
-    if abs(cx1 - cx2) >= MERGE_X_CENTER_TOLERANCE * max(w1, w2):
+    x_near = abs(cx1 - cx2) < MERGE_X_CENTER_TOLERANCE * max(w1, w2)
+    if not x_near:
+        inter_w = min(x1 + w1, x2 + w2) - max(x1, x2)
+        x_near = inter_w > MERGE_X_OVERLAP_RATIO * min(w1, w2)
+    if not x_near:
         return False
-    # 2) Y 轴距离很近（间距 < 较矮框高度 × MERGE_Y_GAP_RATIO；负数 = 已相交，直接算近）
+    # 2) Y 轴间距 < 较矮框高度 × 阈值（负数 = 已相交，直接算近）
     gap_y = max(y1, y2) - min(y1 + h1, y2 + h2)
     return gap_y < MERGE_Y_GAP_RATIO * min(h1, h2)
 
