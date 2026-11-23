@@ -24,7 +24,8 @@ import { uploadImage } from "@/lib/upload";
 /** 单个章节的表单数据 */
 interface ChapterForm {
   title: string;
-  images: string[];
+  /** 内页列表：null = 已选中尚未传完的占位槽（位置固定，保证顺序与选择一致） */
+  images: (string | null)[];
 }
 
 /** 投稿表单主体：使用 useSearchParams，必须在 Suspense 内渲染（见底部默认导出） */
@@ -134,29 +135,42 @@ function UploadForm() {
     pagesInputRef.current?.click();
   };
 
-  // 某章节内页多选：按 2 张一批排队上传到 R2（绝不全量并发），
-  // 批内 2 张同时传、每张传完立即显示，一批完成再传下一批；
-  // 任一张失败终止后续批次，已成功的保留
+  // 某章节内页多选：选图瞬间按选择顺序插入 null 占位槽，
+  // 之后按 2 张一批排队上传（绝不全量并发），每张传完【按位置回填】自己的槽位
+  // —— 先传完的也只写进自己原来的位置，顺序永远与选择顺序严格一致；
+  // 任一张失败终止后续批次（槽位保留 null 可手动删除或重选），已成功的保留
   const handlePages = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const index = activeChapterRef.current;
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
     if (files.length === 0) return;
-    const GROUP = 2;
+    // 占位槽起始下标（本次选择的图片排在现有图片之后）
+    const base = chapters[index]?.images.length ?? 0;
+    setChapters((prev) =>
+      prev.map((c, i) =>
+        i === index ? { ...c, images: [...c.images, ...files.map(() => null)] } : c
+      )
+    );
     setUploadState({ chapter: index, pending: files.length });
     try {
       let aborted = false;
+      const GROUP = 2;
       for (let start = 0; start < files.length && !aborted; start += GROUP) {
         const batch = files.slice(start, start + GROUP);
-        // 批内并发（最多 2 张）：先完成的先显示，不等整批
+        // 批内并发（最多 2 张）：回填各自的槽位，互不抢位
         await Promise.all(
-          batch.map(async (file) => {
+          batch.map(async (file, k) => {
+            const slot = base + start + k;
             try {
               const url = await uploadImage(file);
               setChapters((prev) =>
-                prev.map((c, i) =>
-                  i === index ? { ...c, images: [...c.images, url] } : c
-                )
+                prev.map((c, i) => {
+                  if (i !== index) return c;
+                  const imgs = [...c.images];
+                  if (slot < imgs.length) imgs[slot] = url;
+                  else imgs.push(url); // 越界兜底：push 到尾部
+                  return { ...c, images: imgs };
+                })
               );
             } catch (err) {
               showToast(err instanceof Error ? err.message : "内页上传失败");
@@ -174,11 +188,13 @@ function UploadForm() {
     }
   };
 
-  // 移除某章节的单张内页
-  const removePage = (chapterIndex: number, image: string) => {
+  // 移除某章节的单张内页（含失败占位槽），按下标删，剩余图片顺序保持
+  const removePage = (chapterIndex: number, pageIndex: number) => {
     setChapters((prev) =>
       prev.map((c, i) =>
-        i === chapterIndex ? { ...c, images: c.images.filter((s) => s !== image) } : c
+        i === chapterIndex
+          ? { ...c, images: c.images.filter((_, k) => k !== pageIndex) }
+          : c
       )
     );
   };
@@ -212,11 +228,19 @@ function UploadForm() {
       showToast("请先登录后再投稿");
       return;
     }
+    // 失败占位槽（null）未处理完不允许提交：保证章节内页不缺页、顺序完整
+    const badChapter = chapters.findIndex((c) => c.images.some((s) => s === null));
+    if (badChapter !== -1) {
+      showToast(
+        `第${badChapter + 1}话还有未上传成功的内页，请点 X 删除后重新添加`
+      );
+      return;
+    }
     // 数据组装：[{ title, images }, ...]；即使只有一章也是单元素数组
     // 追加模式空标题按“第N话”占位，后端会接着目标漫画章节数续排
     const chaptersPayload = chapters.map((c, i) => ({
       title: c.title.trim() || `第${i + 1}话`,
-      images: [...c.images],
+      images: c.images as string[],
     }));
     setSubmitting(true);
     try {
@@ -427,33 +451,52 @@ function UploadForm() {
 
                 {/* 该章节专属的内页多图上传 */}
                 <div className="mt-3 grid grid-cols-3 gap-2">
-                  {chapter.images.map((src, pi) => (
-                    <div key={src} className="relative">
-                      <img
-                        src={src}
-                        alt={`${chapter.title || `第${ci + 1}话`} 内页 ${pi + 1}`}
-                        className="aspect-[3/4] w-full rounded-lg object-cover"
-                      />
-                      <button
-                        type="button"
-                        aria-label={`移除内页 ${pi + 1}`}
-                        onClick={() => removePage(ci, src)}
-                        className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-zinc-900/80 text-white"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    </div>
-                  ))}
-                  {/* 上传中的占位框：串行逐张，传完一张立即换成真实预览 */}
-                  {uploadState?.chapter === ci &&
-                    Array.from({ length: uploadState.pending }).map((_, pi) => (
-                      <div
-                        key={`pending-${pi}`}
-                        className="flex aspect-[3/4] items-center justify-center rounded-lg border border-dashed border-violet-300 bg-violet-50"
-                      >
-                        <div className="h-5 w-5 animate-spin rounded-full border-2 border-violet-200 border-t-violet-500" />
+                  {chapter.images.map((src, pi) =>
+                    src === null ? (
+                      /* 占位槽：上传中转圈；上传结束仍是 null = 该张失败，点 X 删除后重选 */
+                      <div key={`slot-${pi}`} className="relative">
+                        <div
+                          className={`flex aspect-[3/4] items-center justify-center rounded-lg border border-dashed ${
+                            uploadState?.chapter === ci
+                              ? "border-violet-300 bg-violet-50"
+                              : "border-red-300 bg-red-50"
+                          }`}
+                        >
+                          {uploadState?.chapter === ci ? (
+                            <div className="h-5 w-5 animate-spin rounded-full border-2 border-violet-200 border-t-violet-500" />
+                          ) : (
+                            <X className="h-5 w-5 text-red-400" />
+                          )}
+                        </div>
+                        {uploadState?.chapter !== ci && (
+                          <button
+                            type="button"
+                            aria-label={`移除失败的内页 ${pi + 1}`}
+                            onClick={() => removePage(ci, pi)}
+                            className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-zinc-900/80 text-white"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
                       </div>
-                    ))}
+                    ) : (
+                      <div key={src} className="relative">
+                        <img
+                          src={src}
+                          alt={`${chapter.title || `第${ci + 1}话`} 内页 ${pi + 1}`}
+                          className="aspect-[3/4] w-full rounded-lg object-cover"
+                        />
+                        <button
+                          type="button"
+                          aria-label={`移除内页 ${pi + 1}`}
+                          onClick={() => removePage(ci, pi)}
+                          className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-zinc-900/80 text-white"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    )
+                  )}
                   <button
                     type="button"
                     aria-label={`为 ${chapter.title || `第${ci + 1}话`} 添加内页`}
