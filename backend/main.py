@@ -1464,6 +1464,9 @@ def review_comic(
             target = db.query(Comic).filter(Comic.id == pending.target_comic_id).first()
             if target is None:
                 raise HTTPException(status_code=400, detail="目标漫画不存在，无法追加章节")
+            # 投稿人为本次追加选择的「是否需要 AI 翻译」同步到目标漫画，
+            # 阅读页的翻译按钮显隐随最新一次追加的设置走
+            target.need_translation = bool(pending.need_translation)
             # 章节序号接在已有章节之后（空标题自动补“第N话”）
             offset = len(target.chapters)
             added_chapters = []

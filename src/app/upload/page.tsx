@@ -134,31 +134,40 @@ function UploadForm() {
     pagesInputRef.current?.click();
   };
 
-  // 某章节内页多选：一张一张串行上传到 R2（绝不 Promise.all 并发全部），
-  // 每张传完立即追加显示；单张失败终止本轮，已成功的保留
+  // 某章节内页多选：按 2 张一批排队上传到 R2（绝不全量并发），
+  // 批内 2 张同时传、每张传完立即显示，一批完成再传下一批；
+  // 任一张失败终止后续批次，已成功的保留
   const handlePages = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const index = activeChapterRef.current;
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
     if (files.length === 0) return;
+    const GROUP = 2;
     setUploadState({ chapter: index, pending: files.length });
     try {
-      for (const file of files) {
-        try {
-          const url = await uploadImage(file);
-          setChapters((prev) =>
-            prev.map((c, i) =>
-              i === index ? { ...c, images: [...c.images, url] } : c
-            )
-          );
-        } catch (err) {
-          showToast(err instanceof Error ? err.message : "内页上传失败");
-          break;
-        } finally {
-          setUploadState((s) =>
-            s && s.pending > 1 ? { ...s, pending: s.pending - 1 } : null
-          );
-        }
+      let aborted = false;
+      for (let start = 0; start < files.length && !aborted; start += GROUP) {
+        const batch = files.slice(start, start + GROUP);
+        // 批内并发（最多 2 张）：先完成的先显示，不等整批
+        await Promise.all(
+          batch.map(async (file) => {
+            try {
+              const url = await uploadImage(file);
+              setChapters((prev) =>
+                prev.map((c, i) =>
+                  i === index ? { ...c, images: [...c.images, url] } : c
+                )
+              );
+            } catch (err) {
+              showToast(err instanceof Error ? err.message : "内页上传失败");
+              aborted = true;
+            } finally {
+              setUploadState((s) =>
+                s && s.pending > 1 ? { ...s, pending: s.pending - 1 } : null
+              );
+            }
+          })
+        );
       }
     } finally {
       setUploadState(null);
@@ -470,8 +479,7 @@ function UploadForm() {
           </div>
         </div>
 
-        {/* 是否需要 AI 翻译：Segmented Control（追加模式隐藏，只保留章节管理） */}
-        {mode === "new" && (
+        {/* 是否需要 AI 翻译：Segmented Control（新建与追加章节模式都显示） */}
         <div className="rounded-2xl border border-white/60 bg-white/70 p-4 shadow-[0_8px_32px_0_rgba(31,38,135,0.08)] backdrop-blur-xl">
           <p className="text-sm font-semibold text-zinc-900">是否需要 AI 翻译</p>
           <div className="mt-3 grid grid-cols-2 gap-1 rounded-xl bg-zinc-100 p-1">
@@ -499,7 +507,6 @@ function UploadForm() {
             </button>
           </div>
         </div>
-        )}
 
         {/* 提交审核 */}
         <button
