@@ -329,8 +329,8 @@ class TranslationTask(Base):
     )
 
 
-# 每用户同时进行中任务上限（与前端 3 张一组批量提交对齐）
-TASK_LIMIT_PER_USER = 3
+# 每用户同时进行中任务上限（一张一张串行翻译：同时只处理 1 个任务）
+TASK_LIMIT_PER_USER = 1
 
 
 # ===== 阶段一：先建表，再执行任何模块级数据库查询 =====

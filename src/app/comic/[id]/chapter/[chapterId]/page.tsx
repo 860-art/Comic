@@ -43,6 +43,8 @@ interface ApiChapter {
 interface TranslateBubble {
   box: [number, number, number, number];
   bg_color: string;
+  /** 后端从原气泡文字像素采样出的文字颜色；旧缓存可能没有 → 回退黑白对比色 */
+  text_color?: string | null;
   original: string;
   translated: string;
 }
@@ -284,14 +286,12 @@ export default function ComicReadPage({
    * 单页翻译：幂等提交任务（POST /api/translate/tasks）→ 轮询状态直到终态。
    * 后端幂等键 comic_id+page_id+target_lang：已 done 直接返回结果；
    * queued/processing 返回同一 task_id 绝不重复执行；failed 未超限自动重置排队。
-   * batchId：同章相邻 3 页共用一个组标识，后端 worker 凑组后
-   * 并发 OCR + 合并一次 LLM 翻译，组内页面几乎同时完成。
+   * 一张一张提交：当前页面完成（成功或失败）后才提交下一页。
    */
   const runTaskForPage = async (
     src: string,
     i: number,
-    force: boolean,
-    batchId: string
+    force: boolean
   ): Promise<boolean> => {
     setPageStatus((prev) => ({ ...prev, [i]: "loading" }));
     pageStartRef.current[i] = Date.now();
@@ -317,8 +317,6 @@ export default function ComicReadPage({
           target_lang: "zh",
           // BYOK：把用户保存的 Key 随任务交给 worker（为空时服务器 Key 兜底）
           api_key: savedKey.trim(),
-          // 批量组标识：同一组 3 页共用，worker 凑组并发 OCR + 合并一次翻译
-          batch_id: batchId,
           force,
         }),
       });
@@ -401,19 +399,12 @@ export default function ComicReadPage({
       setPageStatus({});
     }
 
-    // 批量流水线：3 页一组并发提交（共用一个 batch_id，后端凑组后
-    // 并发 OCR + 合并一次 LLM 翻译），组内全部完成后继续下一组——
-    // 与后端「每用户同时最多 3 个进行中任务」对齐
-    const GROUP = 3;
+    // 串行流水线：一张一张提交，页 i 完成（成功/失败）后才提交页 i+1，
+    // 后端 worker 单页串行执行，先完成的页面先渲染
     let okCount = 0;
-    for (let start = 0; start < pages.length; start += GROUP) {
-      const batchId = `${comic?.id ?? 0}:${chapter?.id ?? "x"}:g${Math.floor(start / GROUP)}`;
-      const results = await Promise.all(
-        pages
-          .slice(start, start + GROUP)
-          .map((src, k) => runTaskForPage(src, start + k, force, batchId))
-      );
-      okCount += results.filter(Boolean).length;
+    for (let i = 0; i < pages.length; i++) {
+      const ok = await runTaskForPage(pages[i], i, force);
+      if (ok) okCount++;
     }
 
     setToastMsg(
@@ -435,8 +426,7 @@ export default function ComicReadPage({
       delete next[i];
       return next;
     });
-    // 单页重试单独成组（组内只有它自己），不影响其它页面
-    const ok = await runTaskForPage(src, i, true, `retry:${chapter?.id ?? "x"}:${i}`);
+    const ok = await runTaskForPage(src, i, true);
     setToastMsg(
       ok
         ? `第 ${i + 1} 页翻译完成`
@@ -602,25 +592,38 @@ export default function ComicReadPage({
                     </button>
                   )}
                   {/* 翻译气泡覆盖层：按后端 box 坐标换算百分比定位；
-                      背景用取色 bg_color 加 80% 透明度 + backdrop-blur；文字按背景亮度自动黑/白 */}
+                      背景取气泡原色，文字颜色取自【原文字像素】采样（旧缓存回退黑白）；
+                      不裁切 + 高度可撑开 + 按字数自适应字号 → 中文字全部完整露出 */}
                   {size &&
                     bubbles.map((bubble, j) => {
                       const [bx, by, bw, bh] = bubble.box;
+                      const n = bubble.translated.length;
+                      // cqw = 气泡自身宽度的 1%；译文越长字号越小，保证放得下
+                      const fontCqw = n <= 6 ? 9 : n <= 12 ? 7 : n <= 24 ? 5 : 3.6;
                       return (
                         <div
                           key={j}
                           title={`${bubble.original} → ${bubble.translated}`}
-                          className="absolute flex items-center justify-center overflow-hidden rounded-md p-1 text-center text-sm font-bold leading-tight break-words shadow-[0_2px_8px_rgba(0,0,0,0.25)] ring-1 ring-black/10 drop-shadow-sm backdrop-blur-sm"
+                          className="absolute flex items-center justify-center rounded-md p-1 text-center font-bold leading-tight shadow-[0_2px_8px_rgba(0,0,0,0.25)] ring-1 ring-black/10 drop-shadow-sm backdrop-blur-sm"
                           style={{
                             left: `${(bx / size.w) * 100}%`,
                             top: `${(by / size.h) * 100}%`,
                             width: `${(bw / size.w) * 100}%`,
-                            height: `${(bh / size.h) * 100}%`,
+                            minHeight: `${(bh / size.h) * 100}%`,
                             backgroundColor: hexToRgba(bubble.bg_color, 0.8),
-                            color: contrastTextColor(bubble.bg_color),
+                            color: bubble.text_color || contrastTextColor(bubble.bg_color),
+                            containerType: "inline-size",
                           }}
                         >
-                          {bubble.translated}
+                          <span
+                            className="block w-full break-words"
+                            style={{
+                              fontSize: `clamp(8px, ${fontCqw}cqw, 18px)`,
+                              lineHeight: 1.2,
+                            }}
+                          >
+                            {bubble.translated}
+                          </span>
                         </div>
                       );
                     })}

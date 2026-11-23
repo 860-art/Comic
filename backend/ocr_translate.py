@@ -18,7 +18,6 @@
 import ast
 import base64
 import gc
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -40,7 +39,7 @@ SUPPORTED_LANGS = {"ch": "ch", "en": "en", "korean": "korean", "ko": "korean", "
 # ===== 服务器资源保护：OCR 推理并发限制 =====
 # PaddleOCR 并发推理时每个请求内存峰值叠加，2核4G 上容易 OOM。
 # 信号量把推理串行化：超出的请求排队等待（最多等 90 秒后返回 503）。
-OCR_MAX_CONCURRENCY = max(1, int(os.getenv("OCR_MAX_CONCURRENCY", "2") or "2"))
+OCR_MAX_CONCURRENCY = max(1, int(os.getenv("OCR_MAX_CONCURRENCY", "1") or "1"))
 _ocr_semaphore = threading.BoundedSemaphore(OCR_MAX_CONCURRENCY)
 _OCR_QUEUE_TIMEOUT = 90  # 排队等待上限（秒）
 
@@ -48,9 +47,12 @@ _OCR_QUEUE_TIMEOUT = 90  # 排队等待上限（秒）
 # 韩漫/日漫里巨大的拟声词（如 악、ドン）会被 OCR 识别成一个超大框，
 # 覆盖大半个画面，翻译框会严重遮挡画面 → 按占图比例直接跳过。
 # 阈值放宽到 60%/40%：只有真正铺满画面的巨型拟声词才被过滤，长句旁白/对话全部放行。
-MAX_BOX_WIDTH_RATIO = 0.60   # 文字框宽度超过图片总宽度的 60% → 跳过
-MAX_BOX_HEIGHT_RATIO = 0.40  # 文字框高度超过图片总高度的 40% → 跳过
+MAX_BOX_WIDTH_RATIO = 0.60   # 文字框宽度超过图片总宽度的 60% → 检查是否为长句标题
+MAX_BOX_HEIGHT_RATIO = 0.40  # 文字框高度超过图片总高度的 40% → 检查是否为长句标题
 MIN_MEANINGFUL_CHARS = 2     # 有效字符（去掉标点/空白后的字母数字）少于 2 个 → 跳过（单字符拟声词/标点）
+# 大尺寸框里有效字符 ≥ 此数 → 判定为横幅标题/旁白（如 "AFTER I POSSESSED THAT EMPTY BODY..."），
+# 必须翻译放行；只有短短几个字的巨型拟声词（악、ドン）才真正跳过
+LONG_BANNER_MIN_CHARS = 8
 
 # ===== OCR 懒加载单例（按语言缓存；启动预热 + 首次调用兜底） =====
 # PaddleOCR 3.x 默认加载 PP-OCRv5 **Server** 模型（det ~85MB / rec ~90MB），
@@ -277,14 +279,23 @@ def _filter_items(items: list[dict], img: np.ndarray) -> list[dict]:
     skipped = 0
     for it in items:
         _, _, w, h = it["box"]
+        meaningful_chars = len(_PUNCT_RE.sub("", it["text"]))
         if w > img_w * MAX_BOX_WIDTH_RATIO or h > img_h * MAX_BOX_HEIGHT_RATIO:
-            skipped += 1
-            print(
-                f"[translate]   跳过大框: {it['text']!r} box={it['box']} "
-                f"(占图宽 {w / img_w:.0%} / 占图高 {h / img_h:.0%})"
-            )
-            continue
-        if len(_PUNCT_RE.sub("", it["text"])) < MIN_MEANINGFUL_CHARS:
+            # 超宽/超高框：长句是封面标题、章节横幅或长旁白 → 放行翻译；
+            # 只有短短几个字的巨型拟声词（악、ドン）才跳过，避免遮挡画面
+            if meaningful_chars >= LONG_BANNER_MIN_CHARS:
+                print(
+                    f"[translate]   保留大尺寸标题/横幅: {it['text']!r} "
+                    f"(占图宽 {w / img_w:.0%} / 占图高 {h / img_h:.0%})"
+                )
+            else:
+                skipped += 1
+                print(
+                    f"[translate]   跳过大框: {it['text']!r} box={it['box']} "
+                    f"(占图宽 {w / img_w:.0%} / 占图高 {h / img_h:.0%})"
+                )
+                continue
+        if meaningful_chars < MIN_MEANINGFUL_CHARS:
             skipped += 1
             print(f"[translate]   跳过无效短文本: {it['text']!r} box={it['box']}")
             continue
@@ -321,6 +332,51 @@ def _bubble_bg_color(img: np.ndarray, box: list[int]) -> str:
         edge = region.reshape(-1, 3)
     med = np.median(edge, axis=0).astype(int)  # BGR
     return "#{:02x}{:02x}{:02x}".format(int(med[2]), int(med[1]), int(med[0]))
+
+
+def _bubble_text_color(img: np.ndarray, box: list[int], bg_hex: str) -> Optional[str]:
+    """采样文字框内【原本的文字像素】颜色，作为译文文字颜色（不再是单纯黑白）。
+
+    判定前景：与气泡背景色差异明显的像素（描边字、彩色标题也能取到主色），
+    取其中位数抑制抗锯齿边缘；样本太少或与背景对比不足 → 返回 None，
+    前端回退到按背景亮度自动取黑/白，保证任何情况下译文都可读。
+    """
+    x, y, w, h = box
+    img_h, img_w = img.shape[:2]
+    # 内缩 5% 避开文字框外沿的气泡描边
+    ix1, iy1 = max(0, x + int(w * 0.05)), max(0, y + int(h * 0.05))
+    ix2, iy2 = min(img_w, x + w - int(w * 0.05)), min(img_h, y + h - int(h * 0.05))
+    if ix2 <= ix1 or iy2 <= iy1:
+        return None
+    try:
+        s = bg_hex.lstrip("#")
+        bg_rgb = np.array([int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)])
+    except Exception:
+        return None
+    region = img[iy1:iy2, ix1:ix2].reshape(-1, 3).astype(np.int32)
+    bg_bgr = bg_rgb[::-1].astype(np.int32)  # cv2 图像是 BGR
+    diff = np.max(np.abs(region - bg_bgr), axis=1)
+    fg = region[diff > 50]  # 与背景差异明显 = 文字笔画
+    if len(fg) < max(10, int(len(region) * 0.005)):
+        return None
+    med = np.median(fg, axis=0).astype(int)  # BGR
+    lum_fg = 0.299 * med[2] + 0.587 * med[1] + 0.114 * med[0]
+    lum_bg = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
+    if abs(lum_fg - lum_bg) < 40:  # 取出的颜色与背景太接近 → 回退对比色
+        return None
+    return "#{:02x}{:02x}{:02x}".format(int(med[2]), int(med[1]), int(med[0]))
+
+
+def _build_translated_bubble(img: np.ndarray, item: dict, translated_text: str) -> dict:
+    """统一组装单条译文气泡：坐标 + 背景色 + 原文字颜色 + 原文/译文。"""
+    bg = _bubble_bg_color(img, item["box"])
+    return {
+        "box": item["box"],
+        "bg_color": bg,
+        "text_color": _bubble_text_color(img, item["box"], bg),
+        "original": item["text"],
+        "translated": translated_text,
+    }
 
 
 # ===== 同气泡行合并：把同一气泡里上下贴近的多行小框合并成一个大气泡框 =====
@@ -995,12 +1051,7 @@ async def translate_comic(request: Request):
         )
 
     result = [
-        {
-            "box": it["box"],
-            "bg_color": _bubble_bg_color(img, it["box"]),
-            "original": it["text"],
-            "translated": translated[i],
-        }
+        _build_translated_bubble(img, it, translated[i])
         for i, it in enumerate(items)
     ]
     # 新图翻译完成：结果写入缓存，下次同图直接命中
@@ -1204,18 +1255,6 @@ TRANSLATE_BATCH_SIZE = 5
 # 队列空转轮询间隔（秒）
 _WORKER_IDLE_SLEEP = 1.5
 
-# ===== 批量合并翻译（提速省钱核心） =====
-# 一批最多几页：前端每次并发提交相邻 3 页，worker 凑同组任务一起处理
-_BATCH_MAX = 3
-# 组内并发 OCR 线程数（PaddleOCR 吃 CPU/内存，Railway 上最多 2 张同时跑）
-_BATCH_OCR_WORKERS = min(2, OCR_MAX_CONCURRENCY)
-# 凑组等待：worker 取到带 batch_id 的任务后，若同组还没到齐，短暂等待
-# 前端其余的提交请求入库（毫秒级延迟），凑不齐也不无限等
-_BATCH_MATE_WAIT = 0.8
-# 合并翻译的总文本条数上限：几页文本拼成一个数组一次调 LLM。
-# 超过上限直接走逐页翻译（每页内部仍有 5 条小批量+逐条降级），防 payload 过长必挂
-_MERGE_MAX_TEXTS = 40
-
 _rr_last_user: Optional[int] = None  # 用户轮转游标：记录上一个被调度的用户
 _rr_lock = threading.Lock()
 
@@ -1266,10 +1305,8 @@ def pick_next_task(db):
     - queued 任务按 created_at 升序分组到各用户名下（每用户取最旧的一个）
     - 全局游标 _rr_last_user 记录上次调度的用户，本次从它的下一位用户开始转
     - 取到即标记 processing（由调用方 commit），天然防止重复取
-    - 带 batch_id 的任务自动凑组：把同组 queued 任务一并取出标记 processing，
-      组内稍后并发 OCR + 合并一次 LLM 调用；组员未到齐时短暂等待前端其余
-      提交入库（毫秒级延迟），凑不齐也不无限等
-    返回任务列表（单页任务为长度 1 的列表），队列为空返回 []。"""
+    - 一次只取一个任务：worker 一张一张串行翻译（不凑组、不并发 OCR）
+    返回任务对象或 None。"""
     global _rr_last_user
     from sqlalchemy import asc
 
@@ -1281,7 +1318,7 @@ def pick_next_task(db):
         .all()
     )
     if not rows:
-        return []
+        return None
 
     with _rr_lock:
         # 按用户分组保序（created_at 升序）
@@ -1297,32 +1334,7 @@ def pick_next_task(db):
         chosen = by_user[chosen_user][0]
         _rr_last_user = chosen_user
     chosen.status = "processing"
-
-    # 同批凑组：无 batch_id 的单页任务直接返回
-    batch_id = (getattr(chosen, "batch_id", None) or "").strip()
-    if not batch_id:
-        return [chosen]
-
-    def _mates():
-        return (
-            db.query(TranslationTask)
-            .filter(
-                TranslationTask.batch_id == batch_id,
-                TranslationTask.status == "queued",
-            )
-            .order_by(asc(TranslationTask.id))
-            .limit(_BATCH_MAX - 1)
-            .all()
-        )
-
-    mates = _mates()
-    if len(mates) < _BATCH_MAX - 1:
-        # 组员可能还在路上（前端 3 个 POST 并发入库），短暂等待再查一次
-        time.sleep(_BATCH_MATE_WAIT)
-        mates = _mates()
-    for m in mates:
-        m.status = "processing"
-    return [chosen] + list(mates)
+    return chosen
 
 
 def _load_task_model():
@@ -1447,12 +1459,7 @@ def _ocr_page(task_url: str, task_lang: str) -> dict:
 def _build_page_result(img, items: list, translated: list) -> list:
     """组装单页 result（气泡框 + 背景色 + 原文/译文）。"""
     return [
-        {
-            "box": it["box"],
-            "bg_color": _bubble_bg_color(img, it["box"]),
-            "original": it["text"],
-            "translated": translated[i],
-        }
+        _build_translated_bubble(img, it, translated[i])
         for i, it in enumerate(items)
     ]
 
@@ -1500,7 +1507,7 @@ def _translate_and_store(
 
 
 def run_translation_task(task_id: int) -> None:
-    """执行单个翻译任务（无组或组员未凑齐时的路径）：下载 → OCR → 小批量串行翻译。
+    """执行单个翻译任务（一张一张串行）：下载 → OCR → 小批量串行翻译。
 
     - 每页处理完（成功或失败）立即 gc.collect() 释放内存
     - 失败 attempts+1：未超 TASK_MAX_ATTEMPTS 重置回 queued 等下轮，超限记 failed
@@ -1553,177 +1560,29 @@ def run_translation_task(task_id: int) -> None:
         gc.collect()
 
 
-def _claim_for_run(task_ids: list) -> dict:
-    """批量标记 processing + attempts+1，读取各任务 (url, lang, api_key)。"""
-    from main import SessionLocal, TranslationTask
-
-    meta: dict = {}
-    db = SessionLocal()
-    try:
-        rows = (
-            db.query(TranslationTask)
-            .filter(TranslationTask.id.in_(task_ids))
-            .all()
-        )
-        for t in rows:
-            t.status = "processing"
-            t.error = None
-            t.attempts = (t.attempts or 0) + 1
-            meta[t.id] = {
-                "url": t.image_url,
-                "lang": t.lang or "en",
-                "api_key": (t.api_key or "").strip(),
-            }
-        db.commit()
-    finally:
-        db.close()
-    return meta
-
-
-def run_translation_batch(task_ids: list) -> None:
-    """执行一批（2~3 页）翻译任务：组内并发 OCR → 合并一次 LLM 调用 → 拆分回写。
-
-    - OCR 并发度 = _BATCH_OCR_WORKERS（默认 2，PaddleOCR 吃 CPU/内存防爆）
-    - 合并翻译：几页文本拼成一个扁平数组【只调一次 LLM】（省调用次数与总等待），
-      返回等长数组后按每页条数拆分回各页；返回缺失/不等长/任一页校验不合格
-      → 整体降级逐页翻译（每页内部仍有 5 条小批量 + 逐条兜底），质量不放松
-    - 每页写自己的 result_json/缓存，前端轮询感知与单页完全一致
-    """
-    meta = _claim_for_run(task_ids)
-    ordered_ids = [tid for tid in task_ids if tid in meta]
-    if not ordered_ids:
-        return
-    print(f"[batch] 组 {ordered_ids} 开始：并发 OCR（{_BATCH_OCR_WORKERS} 线程）")
-
-    pages: dict = {}
-    with ThreadPoolExecutor(max_workers=max(1, _BATCH_OCR_WORKERS)) as pool:
-        futs = {
-            tid: pool.submit(_ocr_page, meta[tid]["url"], meta[tid]["lang"])
-            for tid in ordered_ids
-        }
-        for tid, fut in futs.items():
-            try:
-                pages[tid] = fut.result()
-            except Exception as exc:
-                pages[tid] = {"error": f"{type(exc).__name__}: {exc}"}
-
-    # 1) 分流：缓存命中 → done；空结果 → done；OCR 失败 → 走失败重试
-    pending: list = []
-    for tid in ordered_ids:
-        p = pages[tid]
-        if "error" in p:
-            _task_fail_or_retry(tid, p["error"])
-            continue
-        if p["cached_json"]:
-            print(f"[task] #{tid} 缓存命中 hash={p['cache_key'][:16]}…，直接完成")
-            _finish_task(tid, "done", p["cached_json"])
-            continue
-        if not p["items"]:
-            _finish_task(tid, "done", "[]")
-            print(
-                f"[task] #{tid} 未识别到文字（{p['img_w']}x{p['img_h']}），"
-                "空结果完成（不写缓存）"
-            )
-            continue
-        pending.append(tid)
-
-    if not pending:
-        pages.clear()
-        gc.collect()
-        return
-
-    # 2) 合并翻译（≥2 页且总条数不超上限才合并；1 页直接走单页路径）
-    merged_done = False
-    if len(pending) >= 2:
-        merged_texts: list = []
-        offsets: dict = {}
-        for tid in pending:
-            offsets[tid] = (
-                len(merged_texts),
-                len(merged_texts) + len(pages[tid]["items"]),
-            )
-            merged_texts.extend(it["text"] for it in pages[tid]["items"])
-        if len(merged_texts) <= _MERGE_MAX_TEXTS:
-            api_key = next(
-                (meta[tid]["api_key"] for tid in pending if meta[tid]["api_key"]), ""
-            )
-            print(
-                f"[batch] 合并翻译：{len(pending)} 页共 {len(merged_texts)} 条文本，"
-                "一次调用 LLM"
-            )
-            translated = _llm_translate(merged_texts, user_api_key=api_key)
-            if translated is not None and len(translated) == len(merged_texts):
-                # 按页拆分并逐页校验中文；任一页不合格 → 整体降级，保证各页质量一致
-                ok_all = all(
-                    _result_all_chinese(
-                        [{"translated": t} for t in translated[lo:hi]]
-                    )
-                    for tid in pending
-                    for lo, hi in [offsets[tid]]
-                )
-                if ok_all:
-                    for tid in pending:
-                        lo, hi = offsets[tid]
-                        p = pages[tid]
-                        result = _build_page_result(p["img"], p["items"], translated[lo:hi])
-                        result_json = json.dumps(result, ensure_ascii=False)
-                        _cache_put(p["cache_key"], meta[tid]["url"], result)
-                        _finish_task(tid, "done", result_json)
-                        print(f"[task] #{tid} 完成（合并翻译）：{len(result)} 条气泡已回写")
-                    merged_done = True
-            if not merged_done:
-                print("[batch] 合并翻译失败/校验未过，降级为逐页翻译")
-        else:
-            print(
-                f"[batch] 合并文本 {len(merged_texts)} 条超上限 {_MERGE_MAX_TEXTS}，"
-                "直接逐页翻译"
-            )
-
-    # 3) 降级/剩余：逐页走与单页一致的翻译路径（内部含小批量+逐条兜底）
-    if not merged_done:
-        for tid in pending:
-            p = pages[tid]
-            try:
-                _translate_and_store(
-                    tid,
-                    meta[tid]["url"],
-                    p["cache_key"],
-                    p["img"],
-                    p["items"],
-                    meta[tid]["api_key"],
-                )
-            except Exception as exc:
-                _task_fail_or_retry(tid, f"{type(exc).__name__}: {exc}")
-
-    # 批次结束：彻底释放内存
-    pages.clear()
-    gc.collect()
-
-
 def _worker_tick() -> bool:
-    """worker 单轮：轮转取任务（同 batch_id 凑组）并执行。取到并执行返回 True。"""
+    """worker 单轮：轮转取一个 queued 任务并【一张一张】串行执行。取到并执行返回 True。"""
     from main import SessionLocal
 
     db = SessionLocal()
-    task_ids: list = []
+    task_id: Optional[int] = None
     try:
-        tasks = pick_next_task(db)
-        if not tasks:
+        chosen = pick_next_task(db)
+        if chosen is None:
             return False
         db.commit()
-        task_ids = [t.id for t in tasks]
+        task_id = chosen.id
     finally:
         db.close()
-    if len(task_ids) > 1:
-        run_translation_batch(task_ids)
-    else:
-        run_translation_task(task_ids[0])
-    return True
+    if task_id is not None:
+        run_translation_task(task_id)
+        return True
+    return False
 
 
 def _worker_loop() -> None:
     """单 worker 主循环：串行消费数据库队列，空队列时小睡。绝不并发跑 OCR。"""
-    print("[worker] 翻译任务 worker 已启动（批量合并模式：组内并发 OCR + 合并 LLM 翻译）")
+    print("[worker] 翻译任务 worker 已启动（单页串行模式：一张一张翻译）")
     while True:
         try:
             executed = _worker_tick()
