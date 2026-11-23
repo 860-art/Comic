@@ -15,7 +15,7 @@ import {
   type SocialPost,
 } from "@/data/posts";
 import { formatTime } from "@/lib/time";
-import { getToken } from "@/lib/auth";
+import { getAuth, getToken } from "@/lib/auth";
 
 /**
  * 漫画广场：单篇卡片 Feed 流（玻璃拟态风格）。
@@ -208,8 +208,16 @@ function FeedView({
     }
   };
 
-  // 头像/名字 → 跳转对应空间（自己 → /space，他人 → /space/[id]）
-  const openAuthorSpace = () => router.push(getSpaceHref(post.authorId));
+  // 头像/名字 → 跳转对应空间（自己 → /space，他人 → /space/[id]）：
+  // 用登录用户名与帖子作者名比较（后端 username 唯一），命中即自己的空间
+  const openAuthorSpace = () => {
+    const me = getAuth();
+    if (me.isLoggedIn && post.author === me.username) {
+      router.push("/space");
+      return;
+    }
+    router.push(getSpaceHref(post.authorId));
+  };
   // 评论列表：真实帖子统一从后端 GET /api/posts/{id}/comments 读取，
   // 与漫画详情页/他人空间页共用同一数据源（本地库只用于本地种子帖子）
   const [commentsList, setCommentsList] = useState<CommentItem[]>(

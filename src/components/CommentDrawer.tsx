@@ -4,7 +4,8 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronDown, ImagePlus, Plus, ThumbsUp, X } from "lucide-react";
-import { findUserByName, getSpaceHref, ME_DEFAULT_NAME } from "@/data/posts";
+import { findUserByName, getSpaceHref } from "@/data/posts";
+import { getAuth } from "@/lib/auth";
 import { type CommentItem } from "@/data/comments";
 
 /**
@@ -39,9 +40,11 @@ function CommentItemView({
   compact?: boolean;
 }) {
   const router = useRouter();
-  // 点击头像/名字 → 跳转到对应用户空间（当前用户 → /space，其他 → /space/[id]）
+  // 点击头像/名字 → 跳转到对应用户空间（当前登录用户 → /space，其他 → /space/[id]）：
+  // 用登录用户名与评论作者名比较（后端 username 唯一），命中即自己的空间
   const openSpace = () => {
-    if (comment.author === ME_DEFAULT_NAME) {
+    const me = getAuth();
+    if (me.isLoggedIn && comment.author === me.username) {
       router.push("/space");
       return;
     }

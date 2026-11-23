@@ -7,12 +7,18 @@ import {
   ArrowLeft,
   AtSign,
   CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   Hash,
+  Heart,
   ImagePlus,
+  MessageCircle,
   Plus,
   Trash2,
   X,
 } from "lucide-react";
+import CommentDrawer from "@/components/CommentDrawer";
+import { type CommentItem } from "@/data/comments";
 import { ROUTES } from "@/lib/navigation";
 import { ALL_TAGS } from "@/data/mockData";
 import { getToken } from "@/lib/auth";
@@ -29,7 +35,7 @@ import { ME_DEFAULT_AVATAR, ME_DEFAULT_BANNER, ME_DEFAULT_NAME } from "@/data/po
  */
 
 import { API_BASE } from "@/lib/api";
-import { uploadImage } from "@/lib/upload";
+import { dataUrlToFile, uploadImage } from "@/lib/upload";
 
 /** 后端 GET /api/posts 返回的单条数据结构 */
 interface ApiPost {
@@ -40,7 +46,43 @@ interface ApiPost {
   mention_username?: string | null;
   author_id: number;
   author_username: string;
+  likes?: number;
+  comment_count?: number;
   created_at: string;
+}
+
+/** 后端 GET /api/posts/{id}/comments 返回的单条评论 */
+interface ApiComment {
+  id: number;
+  actor_id: number;
+  actor_username: string;
+  actor_avatar?: string | null;
+  content: string;
+  image_url?: string | null;
+  created_at: string;
+}
+
+/** 评论颜色池：CommentItem 需要的无头像兜底背景 */
+const COMMENT_COLORS = [
+  "bg-violet-500",
+  "bg-sky-500",
+  "bg-emerald-500",
+  "bg-amber-500",
+  "bg-rose-500",
+];
+
+function apiCommentToItem(c: ApiComment): CommentItem {
+  return {
+    id: `c-${c.id}`,
+    author: c.actor_username,
+    avatar: c.actor_avatar || undefined,
+    color: COMMENT_COLORS[c.id % COMMENT_COLORS.length],
+    time: formatTime(c.created_at),
+    content: c.content,
+    image: c.image_url || undefined,
+    likes: 0,
+    replies: [],
+  };
 }
 
 /** 帖子全部配图：image_urls 多图优先，旧单图数据回退 image_url */
@@ -67,6 +109,8 @@ export default function SpacePage() {
   const [content, setContent] = useState("");
   const [images, setImages] = useState<string[]>([]);
   const [uploading, setUploading] = useState(false);
+  // 尚未传完的图片数（预览区显示灰色占位框，传完一张减一）
+  const [pendingCount, setPendingCount] = useState(0);
   // @ 好友：当前版本仅支持 @ 管理员（AO），选中后正文后显示紫色徽标并通知对方
   const [mention, setMention] = useState<string | null>(null);
   const [publishing, setPublishing] = useState(false);
@@ -82,6 +126,19 @@ export default function SpacePage() {
   const [deleteTarget, setDeleteTarget] = useState<ApiPost | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
+  // ===== 点赞 / 评论 / 图片放大（与他人空间文章功能保持一致） =====
+  // 我赞过的动态 id 集合（db-{id}），红心初始状态来自 GET /api/posts/liked
+  const [likedIds, setLikedIds] = useState<Set<string>>(new Set());
+  // 每条动态的评论数（db-{id} → count）
+  const [commentCounts, setCommentCounts] = useState<Record<string, number>>({});
+  // 评论抽屉
+  const [drawerPost, setDrawerPost] = useState<ApiPost | null>(null);
+  const [comments, setComments] = useState<CommentItem[]>([]);
+  const [commentsLoading, setCommentsLoading] = useState(false);
+  const [likedComments, setLikedComments] = useState<Record<string, boolean>>({});
+  // 图片放大浏览：当前打开的图片列表与索引
+  const [preview, setPreview] = useState<{ urls: string[]; index: number } | null>(null);
+
   const showToast = (msg: string) => {
     setToastMsg(msg);
     setTimeout(() => setToastMsg(null), 2000);
@@ -93,13 +150,32 @@ export default function SpacePage() {
       const res = await fetch(`${API_BASE}/api/posts`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const all: ApiPost[] = await res.json();
-      setPosts(myId === null ? [] : all.filter((p) => p.author_id === myId));
+      const mine = myId === null ? [] : all.filter((p) => p.author_id === myId);
+      setPosts(mine);
+      // 每条动态的真实评论数（与他人空间一致）
+      const counts: Record<string, number> = {};
+      for (const p of mine) counts[`db-${p.id}`] = p.comment_count ?? 0;
+      setCommentCounts(counts);
     } catch (err) {
       console.error("[空间] 拉取动态失败：", err);
       showToast("动态加载失败，请确认后端已启动");
     } finally {
       setLoading(false);
     }
+  }, [myId]);
+
+  // 我赞过的动态 → 红心初始状态（登录后拉一次）
+  useEffect(() => {
+    const token = getToken();
+    if (!token) return;
+    fetch(`${API_BASE}/api/posts/liked`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.post_ids) setLikedIds(new Set(d.post_ids.map((n: number) => `db-${n}`)));
+      })
+      .catch(() => {});
   }, [myId]);
 
   // 挂载：读资料副本 + 资料接口确认身份（拿 author_id 用于过滤自己的帖子）
@@ -157,14 +233,20 @@ export default function SpacePage() {
       showToast(`最多 9 张，已只保留前 ${room} 张`);
     }
     setUploading(true);
+    setPendingCount(files.slice(0, room).length);
     try {
-      const urls: string[] = [];
       for (const file of files.slice(0, room)) {
-        urls.push(await uploadImage(file));
+        try {
+          const url = await uploadImage(file);
+          // 一张传完立刻显示一张：串行逐张上传，绝不一次性并发全部
+          setImages((prev) => [...prev, url]);
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : "图片上传失败");
+          break; // 单张失败终止本轮，已成功的保留
+        } finally {
+          setPendingCount((n) => Math.max(0, n - 1));
+        }
       }
-      setImages((prev) => [...prev, ...urls]);
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "图片上传失败");
     } finally {
       setUploading(false);
     }
@@ -259,6 +341,116 @@ export default function SpacePage() {
     }
   };
 
+  // ===== 点赞：POST /api/posts/{id}/like 切换红心（与他人空间同一接口） =====
+  const toggleLike = async (post: ApiPost) => {
+    const token = getToken();
+    if (!token) {
+      showToast("请先登录后再点赞");
+      return;
+    }
+    const pid = `db-${post.id}`;
+    try {
+      const res = await fetch(`${API_BASE}/api/posts/${post.id}/like`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        showToast(data?.detail ?? "点赞失败");
+        return;
+      }
+      const nowLiked = !!data.liked;
+      setLikedIds((prev) => {
+        const s = new Set(prev);
+        if (nowLiked) s.add(pid);
+        else s.delete(pid);
+        return s;
+      });
+      setPosts((prev) =>
+        prev.map((p) => (p.id === post.id ? { ...p, likes: data.likes ?? p.likes } : p))
+      );
+      showToast(data.message ?? (nowLiked ? "点赞成功" : "已取消点赞"));
+    } catch {
+      showToast("无法连接服务器");
+    }
+  };
+
+  // ===== 评论抽屉：拉取后端评论列表 =====
+  const openComments = (post: ApiPost) => {
+    setDrawerPost(post);
+    setComments([]);
+    setCommentsLoading(true);
+    fetch(`${API_BASE}/api/posts/${post.id}/comments`)
+      .then((r) => {
+        if (!r.ok) throw new Error("评论接口不可用");
+        return r.json();
+      })
+      .then((list: ApiComment[]) => setComments(list.map(apiCommentToItem)))
+      .catch(() => showToast("评论加载失败，请更新服务器后端"))
+      .finally(() => setCommentsLoading(false));
+  };
+
+  // ===== 发布评论：POST 后端（成功插入列表最前）；带图先上传 R2 =====
+  const publishComment = async (
+    content: string,
+    imageDataUrl?: string
+  ): Promise<boolean> => {
+    if (!drawerPost) return false;
+    const text = content.trim();
+    if (!text && !imageDataUrl) return false;
+    const token = getToken();
+    if (!token) {
+      showToast("请先登录后再评论");
+      return false;
+    }
+    let imageUrl: string | undefined;
+    if (imageDataUrl) {
+      try {
+        imageUrl = await uploadImage(dataUrlToFile(imageDataUrl));
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : "图片上传失败");
+        return false;
+      }
+    }
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/posts/${drawerPost.id}/comments`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ content: text, image_url: imageUrl ?? null }),
+        }
+      );
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        showToast(data?.detail ?? "评论失败");
+        return false;
+      }
+      const n = data.notification;
+      const item = apiCommentToItem({
+        id: n.id,
+        actor_id: n.actor_id,
+        actor_username: n.actor_username,
+        actor_avatar: n.actor_avatar,
+        content: text,
+        image_url: n.image_url,
+        created_at: new Date().toISOString(),
+      });
+      setComments((prev) => [item, ...prev]);
+      setCommentCounts((prev) => ({
+        ...prev,
+        [`db-${drawerPost.id}`]: (prev[`db-${drawerPost.id}`] ?? 0) + 1,
+      }));
+      return true;
+    } catch {
+      showToast("无法连接服务器");
+      return false;
+    }
+  };
+
   // 未登录：拦截并引导登录
   if (!loggedIn) {
     return (
@@ -326,7 +518,9 @@ export default function SpacePage() {
             </div>
             <div className="text-center">
               <p className="text-xs text-zinc-400">获赞</p>
-              <p className="mt-1 text-xl font-bold text-zinc-900">0</p>
+              <p className="mt-1 text-xl font-bold text-zinc-900">
+                {posts.reduce((sum, p) => sum + (p.likes ?? 0), 0)}
+              </p>
             </div>
           </div>
         </div>
@@ -393,32 +587,53 @@ export default function SpacePage() {
                     {post.mention_username}
                   </span>
                 )}
-                {/* 配图：单张全宽，多张三列网格 */}
+                {/* 配图：与他人空间同款排版（单张/两张网格），点击全屏放大 */}
                 {(() => {
                   const urls = postImages(post);
                   if (urls.length === 0) return null;
-                  if (urls.length === 1) {
-                    return (
-                      <img
-                        src={urls[0]}
-                        alt="动态配图"
-                        className="mt-3 max-h-80 w-full rounded-xl object-cover"
-                      />
-                    );
-                  }
                   return (
-                    <div className="mt-3 grid grid-cols-3 gap-2">
-                      {urls.map((u) => (
+                    <div
+                      className={`mt-3 grid gap-2 ${
+                        urls.length > 1 ? "grid-cols-2" : "grid-cols-1"
+                      }`}
+                    >
+                      {urls.map((src, i) => (
                         <img
-                          key={u}
-                          src={u}
+                          key={src}
+                          src={src}
                           alt="动态配图"
-                          className="aspect-square w-full rounded-lg object-cover"
+                          onClick={() => setPreview({ urls, index: i })}
+                          className="max-h-80 w-full cursor-zoom-in rounded-xl object-cover transition-opacity hover:opacity-90"
                         />
                       ))}
                     </div>
                   );
                 })()}
+                {/* 底部操作栏：点赞（红心可切换）+ 评论，与他人空间一致 */}
+                <div className="mt-3 flex items-center gap-6 border-t border-white/60 pt-3 text-sm text-zinc-700">
+                  <button
+                    type="button"
+                    aria-label="点赞"
+                    onClick={() => toggleLike(post)}
+                    className="flex items-center gap-1.5 transition-transform active:scale-75"
+                  >
+                    <Heart
+                      className={`h-4 w-4 transition-colors ${
+                        likedIds.has(`db-${post.id}`) ? "fill-red-500 text-red-500" : ""
+                      }`}
+                    />
+                    {post.likes ?? 0}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="评论"
+                    onClick={() => openComments(post)}
+                    className="flex items-center gap-1.5"
+                  >
+                    <MessageCircle className="h-4 w-4" />
+                    {commentCounts[`db-${post.id}`] ?? 0}
+                  </button>
+                </div>
               </div>
             ))}
           {!loading && posts.length === 0 && (
@@ -464,7 +679,7 @@ export default function SpacePage() {
             <button
               type="button"
               onClick={handlePublish}
-              disabled={publishing}
+              disabled={publishing || uploading}
               className="rounded-lg bg-violet-500 px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-violet-400 disabled:opacity-50"
             >
               {publishing ? "发布中..." : "发布"}
@@ -519,6 +734,15 @@ export default function SpacePage() {
                     >
                       <X className="h-3.5 w-3.5" />
                     </button>
+                  </div>
+                ))}
+                {/* 上传中的占位框：串行逐张，传完一张立即换成真实预览 */}
+                {Array.from({ length: pendingCount }).map((_, i) => (
+                  <div
+                    key={`pending-${i}`}
+                    className="flex h-24 w-24 items-center justify-center rounded-lg border border-dashed border-violet-300 bg-violet-50"
+                  >
+                    <div className="h-5 w-5 animate-spin rounded-full border-2 border-violet-200 border-t-violet-500" />
                   </div>
                 ))}
                 {images.length < 9 && (
@@ -708,6 +932,83 @@ export default function SpacePage() {
         className="hidden"
         onChange={handleFile}
       />
+
+      {/* ===== 评论抽屉（与他人空间共用同一组件） ===== */}
+      {drawerPost && (
+        <CommentDrawer
+          open
+          onClose={() => setDrawerPost(null)}
+          post={{
+            title: drawerPost.content?.slice(0, 24) || "动态",
+            author: drawerPost.author_username,
+          }}
+          comments={comments}
+          loading={commentsLoading}
+          likedComments={likedComments}
+          onToggleLike={(id) =>
+            setLikedComments((prev) => ({ ...prev, [id]: !prev[id] }))
+          }
+          onPublish={publishComment}
+        />
+      )}
+
+      {/* ===== 图片放大浏览：全屏遮罩，多图左右切换，点遮罩/关闭键退出 ===== */}
+      {preview && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/90"
+          onClick={() => setPreview(null)}
+        >
+          <button
+            type="button"
+            aria-label="关闭放大预览"
+            onClick={() => setPreview(null)}
+            className="absolute right-4 top-4 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md transition-colors hover:bg-white/20"
+          >
+            <X className="h-5 w-5" />
+          </button>
+          <img
+            src={preview.urls[preview.index]}
+            alt="图片放大预览"
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[85vh] max-w-full object-contain"
+          />
+          {preview.urls.length > 1 && (
+            <>
+              <button
+                type="button"
+                aria-label="上一张"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPreview((p) =>
+                    p
+                      ? { ...p, index: (p.index - 1 + p.urls.length) % p.urls.length }
+                      : p
+                  );
+                }}
+                className="absolute left-3 flex h-11 w-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md transition-colors hover:bg-white/20"
+              >
+                <ChevronLeft className="h-5 w-5" />
+              </button>
+              <button
+                type="button"
+                aria-label="下一张"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPreview((p) =>
+                    p ? { ...p, index: (p.index + 1) % p.urls.length } : p
+                  );
+                }}
+                className="absolute right-3 flex h-11 w-11 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur-md transition-colors hover:bg-white/20"
+              >
+                <ChevronRight className="h-5 w-5" />
+              </button>
+              <span className="absolute bottom-6 left-1/2 -translate-x-1/2 rounded-full bg-black/50 px-3 py-1 text-xs text-white">
+                {preview.index + 1}/{preview.urls.length}
+              </span>
+            </>
+          )}
+        </div>
+      )}
 
       {/* Toast */}
       {toastMsg && (

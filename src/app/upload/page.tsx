@@ -47,6 +47,10 @@ function UploadForm() {
   ]);
   // 当前正在上传内页的章节下标（隐藏 input 共用一个，点击时记住目标章节）
   const activeChapterRef = useRef(0);
+  // 内页串行上传状态：正在上传的章节 + 未传完张数（预览区显示占位框）
+  const [uploadState, setUploadState] = useState<{ chapter: number; pending: number } | null>(
+    null
+  );
   // 是否需要 AI 翻译：Segmented Control（默认 NO）
   const [needTranslation, setNeedTranslation] = useState(false);
   // ===== 投稿模式：new=新建整本 / append=为已有漫画追加章节（URL 参数 ?comic_id=N&type=append）=====
@@ -130,20 +134,34 @@ function UploadForm() {
     pagesInputRef.current?.click();
   };
 
-  // 某章节内页多选：逐张上传到 R2，公网 URL 累积到对应章节
+  // 某章节内页多选：一张一张串行上传到 R2（绝不 Promise.all 并发全部），
+  // 每张传完立即追加显示；单张失败终止本轮，已成功的保留
   const handlePages = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const index = activeChapterRef.current;
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
-    if (files.length > 0) {
-      try {
-        const urls = await Promise.all(files.map(uploadImage));
-        setChapters((prev) =>
-          prev.map((c, i) => (i === index ? { ...c, images: [...c.images, ...urls] } : c))
-        );
-      } catch (err) {
-        showToast(err instanceof Error ? err.message : "内页上传失败");
+    if (files.length === 0) return;
+    setUploadState({ chapter: index, pending: files.length });
+    try {
+      for (const file of files) {
+        try {
+          const url = await uploadImage(file);
+          setChapters((prev) =>
+            prev.map((c, i) =>
+              i === index ? { ...c, images: [...c.images, url] } : c
+            )
+          );
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : "内页上传失败");
+          break;
+        } finally {
+          setUploadState((s) =>
+            s && s.pending > 1 ? { ...s, pending: s.pending - 1 } : null
+          );
+        }
       }
+    } finally {
+      setUploadState(null);
     }
   };
 
@@ -417,6 +435,16 @@ function UploadForm() {
                       </button>
                     </div>
                   ))}
+                  {/* 上传中的占位框：串行逐张，传完一张立即换成真实预览 */}
+                  {uploadState?.chapter === ci &&
+                    Array.from({ length: uploadState.pending }).map((_, pi) => (
+                      <div
+                        key={`pending-${pi}`}
+                        className="flex aspect-[3/4] items-center justify-center rounded-lg border border-dashed border-violet-300 bg-violet-50"
+                      >
+                        <div className="h-5 w-5 animate-spin rounded-full border-2 border-violet-200 border-t-violet-500" />
+                      </div>
+                    ))}
                   <button
                     type="button"
                     aria-label={`为 ${chapter.title || `第${ci + 1}话`} 添加内页`}
@@ -477,7 +505,7 @@ function UploadForm() {
         <button
           type="button"
           onClick={handleSubmit}
-          disabled={submitting}
+          disabled={submitting || uploadState !== null}
           className="w-full rounded-2xl bg-violet-500 py-3.5 text-sm font-semibold text-white shadow-lg transition-colors hover:bg-violet-400 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
         >
           {submitting ? "提交中..." : "提交审核"}
