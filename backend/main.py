@@ -1238,6 +1238,14 @@ def delete_comic(
     if comic is None:
         raise HTTPException(status_code=404, detail="漫画不存在")
     title = comic.title
+    # 先收集封面与全部章节内页 URL（级联删除后再访问 chapters 就拿不到了），
+    # 删库后同步清理 R2 对象（存储不残留）
+    comic_images = [comic.cover_image]
+    for ch in comic.chapters:
+        try:
+            comic_images.extend(json.loads(ch.images or "[]"))
+        except Exception:
+            pass
     # 级联删除该漫画的所有收藏记录
     removed_collections = (
         db.query(Collection)
@@ -1251,6 +1259,8 @@ def delete_comic(
         f"[admin] 管理员 {admin.username} 删除了漫画 #{comic_id}《{title}》"
         f"（级联清理收藏 {removed_collections} 条）"
     )
+    # 已确认删除 → 封面 + 章节内页对应的 R2 对象一并清理（按投稿人身份查引用）
+    _purge_r2_images(db, comic.submitter_id or admin.id, comic_images)
     return {"message": "删除成功", "comic_id": comic_id}
 
 
@@ -1551,8 +1561,18 @@ def review_comic(
             ],
         }
 
-    # reject：标记驳回（保留记录供『我的投稿』展示已驳回状态）并通知投稿人
+    # reject：标记驳回（保留记录供『我的投稿』展示已驳回状态）并通知投稿人；
+    # 封面与章节内页已确认废弃 → R2 对象立即清除（存储不残留），
+    # 记录里的图片 URL 同步置空（前端显示占位，避免裂图；重新投稿需重新传图）
+    rejected_images = [pending.cover_url]
+    try:
+        for ch in json.loads(pending.chapters or "[]"):
+            rejected_images.extend(ch.get("images") or [])
+    except Exception:
+        pass
     pending.status = "rejected"
+    pending.cover_url = None
+    pending.chapters = "[]"
     db.add(
         Notification(
             type="review",
@@ -1563,6 +1583,7 @@ def review_comic(
         )
     )
     db.commit()
+    _purge_r2_images(db, pending.submitter_id, rejected_images)
     return {"message": "已驳回"}
 
 
@@ -1774,7 +1795,42 @@ def _url_still_referenced(db: Session, user_id: int, url: str) -> bool:
         .first()
     ):
         return True
+    if (
+        db.query(Notification)
+        .filter(
+            Notification.actor_id == user_id,
+            Notification.image_url == url,
+        )
+        .first()
+    ):
+        return True
     return False
+
+
+def _purge_r2_images(db: Session, owner_id: int, urls) -> None:
+    """数据确认删除后，清理其图片对应的 R2 对象（存储不残留）。
+
+    - 仅处理本站对象存储的 URL（外链 / data:URL 自动跳过）
+    - 每个 URL 删除前先用 _url_still_referenced 检查该用户其它数据是否仍引用
+      （防同一图多处使用误删），无引用才删
+    - 失败只打日志不抛错：清理是附带动作，不能阻塞删除主流程
+    """
+    seen: set[str] = set()
+    for u in urls or []:
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        key = _r2_object_key(u)
+        if key is None:
+            continue
+        try:
+            if _url_still_referenced(db, owner_id, u):
+                print(f"[r2] {key} 仍被其它数据引用，跳过清理")
+                continue
+        except Exception as exc:
+            print(f"[r2] 引用检查失败 {key}: {type(exc).__name__}: {exc}（保守跳过）")
+            continue
+        _delete_r2_object_quietly(key)
 
 
 @app.post("/api/upload")
@@ -1926,8 +1982,11 @@ def delete_post(
         raise HTTPException(status_code=404, detail="帖子不存在")
     if post.author_id != user.id:
         raise HTTPException(status_code=403, detail="只能删除自己的动态")
+    # 先收集配图 URL，删库后同步清理 R2 对象（存储不残留）
+    post_images = [post.image_url] + list(post.image_urls or [])
     db.delete(post)
     db.commit()
+    _purge_r2_images(db, user.id, post_images)
     return {"message": "删除成功"}
 
 
@@ -2157,6 +2216,10 @@ def delete_notification(
         raise HTTPException(status_code=404, detail="通知不存在")
     if user.role != "admin" and notification.recipient_id != user.id:
         raise HTTPException(status_code=403, detail="无权限：只能删除发给自己的通知")
+    # 评论附图：删通知后同步清理 R2 对象（其它数据仍引用时会自动跳过）
+    comment_image = notification.image_url
     db.delete(notification)
     db.commit()
+    if comment_image:
+        _purge_r2_images(db, notification.actor_id or user.id, [comment_image])
     return {"message": "通知已删除", "id": notification_id}
