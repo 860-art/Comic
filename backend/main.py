@@ -318,12 +318,19 @@ class TranslationTask(Base):
     # 用户 BYOK 密钥（前端填的智谱 Key）：异步 worker 执行时需要它。
     # 仅任务进行中暂存，进入 done/failed 终态时立即清空，日志永不输出明文。
     api_key: Mapped[str | None] = mapped_column(Text)
+    # 批量组标识：同一章相邻 3 页共用一个 batch_id，worker 凑组后
+    # 组内并发 OCR + 合并成一次 LLM 调用（大幅提速省钱）；单页提交时为空。
+    batch_id: Mapped[str | None] = mapped_column(Text)
     # 提交人：用于「每用户同时最多 1 个进行中任务」与调度轮转公平性
     user_id: Mapped[int] = mapped_column(Integer, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
+
+
+# 每用户同时进行中任务上限（与前端 3 张一组批量提交对齐）
+TASK_LIMIT_PER_USER = 3
 
 
 # ===== 阶段一：先建表，再执行任何模块级数据库查询 =====
@@ -415,13 +422,15 @@ if _inspector.has_table("comments"):
         if "image_url" not in _comment_cols:
             _conn.execute(text("ALTER TABLE comments ADD COLUMN image_url TEXT"))
 
-# 已部署过的服务器：translation_tasks 表缺 api_key（BYOK 密钥）列时自动补列
-# （create_all 不会给已存在的表加列，不补则 worker 查询直接报错）
+# 已部署过的服务器：translation_tasks 表缺 api_key（BYOK 密钥）/ batch_id（批量组）
+# 列时自动补列（create_all 不会给已存在的表加列，不补则 worker 查询直接报错）
 if _inspector.has_table("translation_tasks"):
     _tt_cols = {col["name"] for col in _inspector.get_columns("translation_tasks")}
     with engine.begin() as _conn:
         if "api_key" not in _tt_cols:
             _conn.execute(text("ALTER TABLE translation_tasks ADD COLUMN api_key TEXT"))
+        if "batch_id" not in _tt_cols:
+            _conn.execute(text("ALTER TABLE translation_tasks ADD COLUMN batch_id TEXT"))
 
 # 旧版 notifications 表：post_id 为 NOT NULL（审核通知不属于帖子，需要可空）→ 重建表；
 # 同时补 is_read（未读红点）。SQLite 不支持改列约束，只能建新表搬数据。
@@ -660,6 +669,8 @@ class TranslationTaskRequest(BaseModel):
     target_lang: str = "zh"
     # BYOK：用户自己的智谱 API Key（为空时 worker 降级服务器环境变量 Key）
     api_key: str = ""
+    # 批量组标识：同一章相邻页共用（如 "12:3:g0"），worker 凑组并发 OCR + 合并翻译
+    batch_id: str = ""
     # force=true：done 任务也重置排队重跑（对应前端「重新翻译」）
     force: bool = False
 
@@ -675,13 +686,15 @@ def create_translation_task(
     - 已 done（且非 force）→ 直接返回结果，不重复执行
     - queued / processing → 直接返回 task_id，绝不重复入队
     - failed 且未超重试上限（或 force）→ 重置回 queued
-    - 每用户同时最多 1 个进行中任务（queued/processing 各算 1 个）
+    - 每用户同时最多 TASK_LIMIT_PER_USER 个进行中任务（与前端 3 张一组对齐）
     """
     target_lang = (req.target_lang or "zh").strip().lower() or "zh"
     page_id = (req.page_id or "").strip()[:128]
     image_url = (req.image_url or "").strip()
     # BYOK：用户 Key 随任务暂存（worker 执行时用），为空则降级服务器环境变量 Key
     api_key = (req.api_key or "").strip() or None
+    # 批量组标识（同一章相邻 3 页共用），worker 按它凑组并发 OCR + 合并翻译
+    batch_id = (req.batch_id or "").strip()[:128] or None
     if not page_id:
         raise HTTPException(status_code=400, detail="page_id 不能为空")
     if not image_url.startswith(("http://", "https://")):
@@ -705,9 +718,13 @@ def create_translation_task(
                 result = []
             return {"task_id": task.id, "status": "done", "result": result}
         if task.status in ("queued", "processing"):
-            # 幂等：直接返回同一 task_id，绝不重复入队；顺手补上用户刚填的 Key
-            if api_key:
-                task.api_key = api_key
+            # 幂等：直接返回同一 task_id，绝不重复入队；顺手补上 Key 与组标识
+            # （旧前端提交的任务没有 batch_id，新前端重进页面时补齐即可凑组）
+            if api_key or batch_id:
+                if api_key:
+                    task.api_key = api_key
+                if batch_id:
+                    task.batch_id = batch_id
                 db.commit()
             return {"task_id": task.id, "status": task.status}
         # failed（或 force 重译 done）→ 用户主动重新提交即开启新一轮：
@@ -718,23 +735,24 @@ def create_translation_task(
         task.image_url = image_url  # 图片可能换源（重新上传）
         task.lang = (req.lang or "en").strip().lower() or "en"
         task.api_key = api_key
+        task.batch_id = batch_id
         db.commit()
         db.refresh(task)
         return {"task_id": task.id, "status": "queued"}
 
-    # 新任务：每用户同时最多 1 个进行中（queued/processing 都算）
-    busy = (
+    # 新任务：每用户同时最多 3 个进行中（与前端 3 张一组批量提交对齐）
+    busy_count = (
         db.query(TranslationTask)
         .filter(
             TranslationTask.user_id == user.id,
             TranslationTask.status.in_(("queued", "processing")),
         )
-        .first()
+        .count()
     )
-    if busy is not None:
+    if busy_count >= TASK_LIMIT_PER_USER:
         raise HTTPException(
             status_code=429,
-            detail=f"你有一个翻译任务进行中（任务 #{busy.id}），完成后再提交新任务",
+            detail=f"你有 {busy_count} 个翻译任务进行中，等这批完成后再提交",
         )
     task = TranslationTask(
         comic_id=req.comic_id,
@@ -745,6 +763,7 @@ def create_translation_task(
         status="queued",
         user_id=user.id,
         api_key=api_key,
+        batch_id=batch_id,
     )
     db.add(task)
     db.commit()

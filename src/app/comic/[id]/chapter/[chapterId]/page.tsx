@@ -284,12 +284,14 @@ export default function ComicReadPage({
    * 单页翻译：幂等提交任务（POST /api/translate/tasks）→ 轮询状态直到终态。
    * 后端幂等键 comic_id+page_id+target_lang：已 done 直接返回结果；
    * queued/processing 返回同一 task_id 绝不重复执行；failed 未超限自动重置排队。
-   * 前端一次只持有 1 个进行中任务（与后端「每用户最多 1 个进行中」对齐），逐页串行流水线。
+   * batchId：同章相邻 3 页共用一个组标识，后端 worker 凑组后
+   * 并发 OCR + 合并一次 LLM 翻译，组内页面几乎同时完成。
    */
   const runTaskForPage = async (
     src: string,
     i: number,
-    force: boolean
+    force: boolean,
+    batchId: string
   ): Promise<boolean> => {
     setPageStatus((prev) => ({ ...prev, [i]: "loading" }));
     pageStartRef.current[i] = Date.now();
@@ -315,6 +317,8 @@ export default function ComicReadPage({
           target_lang: "zh",
           // BYOK：把用户保存的 Key 随任务交给 worker（为空时服务器 Key 兜底）
           api_key: savedKey.trim(),
+          // 批量组标识：同一组 3 页共用，worker 凑组并发 OCR + 合并一次翻译
+          batch_id: batchId,
           force,
         }),
       });
@@ -397,12 +401,19 @@ export default function ComicReadPage({
       setPageStatus({});
     }
 
-    // 串行流水线：每用户同时只有 1 个进行中任务，页 i 完成后立即提交页 i+1，
-    // 后端单 worker 按用户轮转调度，先完成的页面先渲染
+    // 批量流水线：3 页一组并发提交（共用一个 batch_id，后端凑组后
+    // 并发 OCR + 合并一次 LLM 翻译），组内全部完成后继续下一组——
+    // 与后端「每用户同时最多 3 个进行中任务」对齐
+    const GROUP = 3;
     let okCount = 0;
-    for (let i = 0; i < pages.length; i++) {
-      const ok = await runTaskForPage(pages[i], i, force);
-      if (ok) okCount++;
+    for (let start = 0; start < pages.length; start += GROUP) {
+      const batchId = `${comic?.id ?? 0}:${chapter?.id ?? "x"}:g${Math.floor(start / GROUP)}`;
+      const results = await Promise.all(
+        pages
+          .slice(start, start + GROUP)
+          .map((src, k) => runTaskForPage(src, start + k, force, batchId))
+      );
+      okCount += results.filter(Boolean).length;
     }
 
     setToastMsg(
@@ -424,7 +435,8 @@ export default function ComicReadPage({
       delete next[i];
       return next;
     });
-    const ok = await runTaskForPage(src, i, true);
+    // 单页重试单独成组（组内只有它自己），不影响其它页面
+    const ok = await runTaskForPage(src, i, true, `retry:${chapter?.id ?? "x"}:${i}`);
     setToastMsg(
       ok
         ? `第 ${i + 1} 页翻译完成`

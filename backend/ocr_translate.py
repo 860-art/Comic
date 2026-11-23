@@ -18,6 +18,7 @@
 import ast
 import base64
 import gc
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -39,7 +40,7 @@ SUPPORTED_LANGS = {"ch": "ch", "en": "en", "korean": "korean", "ko": "korean", "
 # ===== 服务器资源保护：OCR 推理并发限制 =====
 # PaddleOCR 并发推理时每个请求内存峰值叠加，2核4G 上容易 OOM。
 # 信号量把推理串行化：超出的请求排队等待（最多等 90 秒后返回 503）。
-OCR_MAX_CONCURRENCY = max(1, int(os.getenv("OCR_MAX_CONCURRENCY", "1") or "1"))
+OCR_MAX_CONCURRENCY = max(1, int(os.getenv("OCR_MAX_CONCURRENCY", "2") or "2"))
 _ocr_semaphore = threading.BoundedSemaphore(OCR_MAX_CONCURRENCY)
 _OCR_QUEUE_TIMEOUT = 90  # 排队等待上限（秒）
 
@@ -1203,6 +1204,18 @@ TRANSLATE_BATCH_SIZE = 5
 # 队列空转轮询间隔（秒）
 _WORKER_IDLE_SLEEP = 1.5
 
+# ===== 批量合并翻译（提速省钱核心） =====
+# 一批最多几页：前端每次并发提交相邻 3 页，worker 凑同组任务一起处理
+_BATCH_MAX = 3
+# 组内并发 OCR 线程数（PaddleOCR 吃 CPU/内存，Railway 上最多 2 张同时跑）
+_BATCH_OCR_WORKERS = min(2, OCR_MAX_CONCURRENCY)
+# 凑组等待：worker 取到带 batch_id 的任务后，若同组还没到齐，短暂等待
+# 前端其余的提交请求入库（毫秒级延迟），凑不齐也不无限等
+_BATCH_MATE_WAIT = 0.8
+# 合并翻译的总文本条数上限：几页文本拼成一个数组一次调 LLM。
+# 超过上限直接走逐页翻译（每页内部仍有 5 条小批量+逐条降级），防 payload 过长必挂
+_MERGE_MAX_TEXTS = 40
+
 _rr_last_user: Optional[int] = None  # 用户轮转游标：记录上一个被调度的用户
 _rr_lock = threading.Lock()
 
@@ -1253,7 +1266,10 @@ def pick_next_task(db):
     - queued 任务按 created_at 升序分组到各用户名下（每用户取最旧的一个）
     - 全局游标 _rr_last_user 记录上次调度的用户，本次从它的下一位用户开始转
     - 取到即标记 processing（由调用方 commit），天然防止重复取
-    返回任务对象或 None。"""
+    - 带 batch_id 的任务自动凑组：把同组 queued 任务一并取出标记 processing，
+      组内稍后并发 OCR + 合并一次 LLM 调用；组员未到齐时短暂等待前端其余
+      提交入库（毫秒级延迟），凑不齐也不无限等
+    返回任务列表（单页任务为长度 1 的列表），队列为空返回 []。"""
     global _rr_last_user
     from sqlalchemy import asc
 
@@ -1265,7 +1281,7 @@ def pick_next_task(db):
         .all()
     )
     if not rows:
-        return None
+        return []
 
     with _rr_lock:
         # 按用户分组保序（created_at 升序）
@@ -1281,7 +1297,32 @@ def pick_next_task(db):
         chosen = by_user[chosen_user][0]
         _rr_last_user = chosen_user
     chosen.status = "processing"
-    return chosen
+
+    # 同批凑组：无 batch_id 的单页任务直接返回
+    batch_id = (getattr(chosen, "batch_id", None) or "").strip()
+    if not batch_id:
+        return [chosen]
+
+    def _mates():
+        return (
+            db.query(TranslationTask)
+            .filter(
+                TranslationTask.batch_id == batch_id,
+                TranslationTask.status == "queued",
+            )
+            .order_by(asc(TranslationTask.id))
+            .limit(_BATCH_MAX - 1)
+            .all()
+        )
+
+    mates = _mates()
+    if len(mates) < _BATCH_MAX - 1:
+        # 组员可能还在路上（前端 3 个 POST 并发入库），短暂等待再查一次
+        time.sleep(_BATCH_MATE_WAIT)
+        mates = _mates()
+    for m in mates:
+        m.status = "processing"
+    return [chosen] + list(mates)
 
 
 def _load_task_model():
@@ -1291,10 +1332,177 @@ def _load_task_model():
     return TranslationTask
 
 
-def run_translation_task(task_id: int) -> None:
-    """执行单个翻译任务：下载 → OCR → 小批量串行翻译 → 译文回写 result_json。
+def _finish_task(
+    task_id: int,
+    status: str,
+    result_json: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    """任务状态回写（独立 session，避免长事务占用连接）。
 
-    - 每页处理完（成功或失败）立即 del + gc.collect() 释放内存
+    进入 done/failed 终态时同时清除暂存的 BYOK 密钥（用完即清，密钥不长期留库）。
+    """
+    from main import SessionLocal, TranslationTask
+
+    db2 = SessionLocal()
+    try:
+        t = db2.query(TranslationTask).filter(TranslationTask.id == task_id).first()
+        if t is None:
+            return
+        t.status = status
+        if result_json is not None:
+            t.result_json = result_json
+        t.error = error
+        if status in ("done", "failed"):
+            t.api_key = None
+        db2.commit()
+    finally:
+        db2.close()
+
+
+def _task_fail_or_retry(task_id: int, error_msg: str) -> None:
+    """任务失败处理：attempts 未超上限 → 重置回 queued 等下轮；超限 → failed 终态。"""
+    from main import SessionLocal, TranslationTask
+
+    print(f"[task] #{task_id} 执行失败: {error_msg}")
+    db3 = SessionLocal()
+    try:
+        t = db3.query(TranslationTask).filter(TranslationTask.id == task_id).first()
+        if t is not None:
+            if (t.attempts or 0) < TASK_MAX_ATTEMPTS:
+                t.status = "queued"
+                t.error = error_msg
+                print(f"[task] #{task_id} 将重试（第 {t.attempts}/{TASK_MAX_ATTEMPTS} 次）")
+            else:
+                t.status = "failed"
+                t.error = error_msg
+                t.api_key = None  # 终态清除暂存密钥（queued 重试时仍需保留）
+                print(f"[task] #{task_id} 重试耗尽，标记 failed")
+            db3.commit()
+    finally:
+        db3.close()
+
+
+def _ocr_page(task_url: str, task_lang: str) -> dict:
+    """单页 OCR 流水线：下载 → 解码 → 缓存检查 → OCR 推理 → 气泡过滤/合并/水印剔除。
+
+    返回 dict：
+      cached_json 非 None → 缓存命中（img/items 为 None，调用方直接写 done）
+      items 为 []        → 无文字页（合法完成态，不写缓存）
+    下载/解码/OCR 任何异常向上抛，由调用方统一走失败重试。
+    线程安全：PaddleOCR 实例共享，并发数由 _ocr_semaphore 限制。
+    """
+    img_bytes = _fetch_image_bytes(task_url)
+    img = _decode_image(img_bytes)
+    img_h, img_w = img.shape[:2]
+
+    # 缓存直取：同图已有【非空】合规中文译文 → 不再跑 OCR 与大模型。
+    # 空数组缓存（上次 OCR 漏检 / 无文字页）不直接复用：重新识别一次，
+    # 避免一次漏检（换模型参数、压缩画质波动）被永久缓存、重新翻译也无效。
+    cache_key = hashlib.sha256(img_bytes).hexdigest()
+    cached_json = _cache_get(cache_key)
+    if cached_json:
+        try:
+            cached_rows = json.loads(cached_json)
+            if (
+                isinstance(cached_rows, list)
+                and cached_rows  # 非空才命中
+                and _result_all_chinese(cached_rows)
+            ):
+                return {
+                    "cache_key": cache_key,
+                    "img": None,
+                    "items": None,
+                    "img_w": img_w,
+                    "img_h": img_h,
+                    "cached_json": cached_json,
+                }
+        except Exception:
+            pass
+
+    ocr = _get_ocr(task_lang)
+    # 信号量保护：batch 内并发线程与旧同步接口 /api/translate 共用同一实例
+    acquired = _ocr_semaphore.acquire(timeout=_OCR_QUEUE_TIMEOUT)
+    if not acquired:
+        raise RuntimeError(f"OCR 排队超时（{_OCR_QUEUE_TIMEOUT}s）")
+    try:
+        raw = ocr.predict(img)
+    finally:
+        _ocr_semaphore.release()
+
+    items = _parse_ocr_result(raw)
+    items = _filter_items(items, img)
+    items = _merge_bubble_lines(items) if items else []
+    items = strip_watermark_items(items)  # 水印/网址气泡不参与翻译，避免整页被拖垮
+    return {
+        "cache_key": cache_key,
+        "img": img,
+        "items": items,
+        "img_w": img_w,
+        "img_h": img_h,
+        "cached_json": None,
+    }
+
+
+def _build_page_result(img, items: list, translated: list) -> list:
+    """组装单页 result（气泡框 + 背景色 + 原文/译文）。"""
+    return [
+        {
+            "box": it["box"],
+            "bg_color": _bubble_bg_color(img, it["box"]),
+            "original": it["text"],
+            "translated": translated[i],
+        }
+        for i, it in enumerate(items)
+    ]
+
+
+def _translate_and_store(
+    task_id: int,
+    task_url: str,
+    cache_key: str,
+    img,
+    items: list,
+    task_api_key: str,
+) -> None:
+    """OCR 结果 → 小批量串行翻译（整批失败降级逐条）→ 译文回写 + 缓存。
+
+    翻译失败抛 RuntimeError（区分「没 Key」与「调用/校验失败」），由调用方走失败重试。
+    """
+    texts = [it["text"] for it in items]
+    print(
+        f"[task] #{task_id} OCR 完成 {len(items)} 个气泡，开始小批量串行翻译"
+        f"（BYOK={'有' if task_api_key else '无'}）"
+    )
+    translated = _llm_translate_serial(texts, user_api_key=task_api_key)
+    if translated is None:
+        # 区分「根本没 Key」与「Key 有但调用/校验失败」，便于按日志快速定位
+        has_any_key = bool(
+            task_api_key
+            or os.getenv("ZHIPU_API_KEY", "").strip()
+            or os.getenv("DEEPSEEK_API_KEY", "").strip()
+        )
+        if not has_any_key:
+            raise RuntimeError(
+                "翻译失败：未配置 API 密钥（前端未传 BYOK，服务器也未设置 "
+                "ZHIPU_API_KEY / DEEPSEEK_API_KEY）"
+            )
+        raise RuntimeError(
+            "翻译失败：大模型调用失败或译文未通过中文校验"
+            "（Key 无效 / 额度不足 / 超时 / 返回了原文），详见服务器日志 [translate]"
+        )
+
+    result = _build_page_result(img, items, translated)
+    result_json = json.dumps(result, ensure_ascii=False)
+    _cache_put(cache_key, task_url, result)
+    _finish_task(task_id, "done", result_json)
+    print(f"[task] #{task_id} 完成：{len(result)} 条气泡已回写 result_json")
+
+
+def run_translation_task(task_id: int) -> None:
+    """执行单个翻译任务（无组或组员未凑齐时的路径）：下载 → OCR → 小批量串行翻译。
+
+    - 每页处理完（成功或失败）立即 gc.collect() 释放内存
     - 失败 attempts+1：未超 TASK_MAX_ATTEMPTS 重置回 queued 等下轮，超限记 failed
     - 执行前查 TranslationCache，同图已有合规中文结果直接 done（省 OCR 与额度）
     """
@@ -1303,22 +1511,6 @@ def run_translation_task(task_id: int) -> None:
     task_lang = "en"
     task_url = ""
     task_api_key = ""
-
-    def _finish(status: str, result_json: Optional[str] = None, error: Optional[str] = None):
-        """终态回写（独立 session，避免长事务占用连接）；同时清除暂存的 BYOK 密钥。"""
-        db2 = SessionLocal()
-        try:
-            t = db2.query(TranslationTask).filter(TranslationTask.id == task_id).first()
-            if t is None:
-                return
-            t.status = status
-            if result_json is not None:
-                t.result_json = result_json
-            t.error = error
-            t.api_key = None  # 用完即清：密钥不长期留在数据库
-            db2.commit()
-        finally:
-            db2.close()
 
     db = SessionLocal()
     try:
@@ -1335,140 +1527,203 @@ def run_translation_task(task_id: int) -> None:
     finally:
         db.close()
 
-    img_bytes: Optional[bytes] = None
-    img = None
     try:
-        img_bytes = _fetch_image_bytes(task_url)
-        img = _decode_image(img_bytes)
-        img_h, img_w = img.shape[:2]
-
-        # 缓存直取：同图已有【非空】合规中文译文 → 不再跑 OCR 与大模型。
-        # 空数组缓存（上次 OCR 漏检 / 无文字页）不直接复用：重新识别一次，
-        # 避免一次漏检（换模型参数、压缩画质波动）被永久缓存、重新翻译也无效。
-        cache_key = hashlib.sha256(img_bytes).hexdigest()
-        cached_json = _cache_get(cache_key)
-        if cached_json:
-            try:
-                cached_rows = json.loads(cached_json)
-                if (
-                    isinstance(cached_rows, list)
-                    and cached_rows  # 非空才命中
-                    and _result_all_chinese(cached_rows)
-                ):
-                    print(f"[task] #{task_id} 缓存命中 hash={cache_key[:16]}…，直接完成")
-                    _finish("done", cached_json)
-                    return
-            except Exception:
-                pass
-
-        ocr = _get_ocr(task_lang)
-        # 信号量保护：worker 串行是常态，但与旧同步接口 /api/translate 共存时防并发推理
-        acquired = _ocr_semaphore.acquire(timeout=_OCR_QUEUE_TIMEOUT)
-        if not acquired:
-            raise RuntimeError(f"OCR 排队超时（{_OCR_QUEUE_TIMEOUT}s）")
-        try:
-            raw = ocr.predict(img)
-        finally:
-            _ocr_semaphore.release()
-
-        items = _parse_ocr_result(raw)
-        items = _filter_items(items, img)
-        items = _merge_bubble_lines(items) if items else []
-        items = strip_watermark_items(items)  # 水印/网址气泡不参与翻译，避免整页被拖垮
-
+        page = _ocr_page(task_url, task_lang)
+        if page["cached_json"]:
+            print(f"[task] #{task_id} 缓存命中 hash={page['cache_key'][:16]}…，直接完成")
+            _finish_task(task_id, "done", page["cached_json"])
+            return
+        items = page["items"]
         if not items:
             # 图片本身无文字（或本次 OCR 漏检）→ 空数组是合法完成态，
             # 但【不写缓存】：下次仍有机会重新识别，不被一次漏检永久锁死
-            _finish("done", "[]")
-            print(f"[task] #{task_id} 未识别到文字（{img_w}x{img_h}），空结果完成（不写缓存）")
+            _finish_task(task_id, "done", "[]")
+            print(
+                f"[task] #{task_id} 未识别到文字（{page['img_w']}x{page['img_h']}），"
+                "空结果完成（不写缓存）"
+            )
             return
-
-        texts = [it["text"] for it in items]
-        print(
-            f"[task] #{task_id} OCR 完成 {len(items)} 个气泡，开始小批量串行翻译"
-            f"（BYOK={'有' if task_api_key else '无'}）"
+        _translate_and_store(
+            task_id, task_url, page["cache_key"], page["img"], items, task_api_key
         )
-        translated = _llm_translate_serial(texts, user_api_key=task_api_key)
-        if translated is None:
-            # 区分「根本没 Key」与「Key 有但调用/校验失败」，便于按日志快速定位
-            has_any_key = bool(
-                task_api_key
-                or os.getenv("ZHIPU_API_KEY", "").strip()
-                or os.getenv("DEEPSEEK_API_KEY", "").strip()
-            )
-            if not has_any_key:
-                raise RuntimeError(
-                    "翻译失败：未配置 API 密钥（前端未传 BYOK，服务器也未设置 "
-                    "ZHIPU_API_KEY / DEEPSEEK_API_KEY）"
-                )
-            raise RuntimeError(
-                "翻译失败：大模型调用失败或译文未通过中文校验"
-                "（Key 无效 / 额度不足 / 超时 / 返回了原文），详见服务器日志 [translate]"
-            )
-
-        result = [
-            {
-                "box": it["box"],
-                "bg_color": _bubble_bg_color(img, it["box"]),
-                "original": it["text"],
-                "translated": translated[i],
-            }
-            for i, it in enumerate(items)
-        ]
-        result_json = json.dumps(result, ensure_ascii=False)
-        _cache_put(cache_key, task_url, result)
-        _finish("done", result_json)
-        print(f"[task] #{task_id} 完成：{len(result)} 条气泡已回写 result_json")
     except Exception as exc:
-        error_msg = f"{type(exc).__name__}: {exc}"
-        print(f"[task] #{task_id} 执行失败: {error_msg}")
-        # 重试判定：本次是第 attempts 次；attempts < 上限 → 回队列，否则 failed 终态
-        db3 = SessionLocal()
-        try:
-            t = db3.query(TranslationTask).filter(TranslationTask.id == task_id).first()
-            if t is not None:
-                if (t.attempts or 0) < TASK_MAX_ATTEMPTS:
-                    t.status = "queued"
-                    t.error = error_msg
-                    print(f"[task] #{task_id} 将重试（第 {t.attempts}/{TASK_MAX_ATTEMPTS} 次）")
-                else:
-                    t.status = "failed"
-                    t.error = error_msg
-                    t.api_key = None  # 终态清除暂存密钥（queued 重试时仍需保留）
-                    print(f"[task] #{task_id} 重试耗尽，标记 failed")
-                db3.commit()
-        finally:
-            db3.close()
+        _task_fail_or_retry(task_id, f"{type(exc).__name__}: {exc}")
     finally:
         # 单页处理结束：彻底释放内存
-        img = None
-        img_bytes = None
         gc.collect()
 
 
+def _claim_for_run(task_ids: list) -> dict:
+    """批量标记 processing + attempts+1，读取各任务 (url, lang, api_key)。"""
+    from main import SessionLocal, TranslationTask
+
+    meta: dict = {}
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(TranslationTask)
+            .filter(TranslationTask.id.in_(task_ids))
+            .all()
+        )
+        for t in rows:
+            t.status = "processing"
+            t.error = None
+            t.attempts = (t.attempts or 0) + 1
+            meta[t.id] = {
+                "url": t.image_url,
+                "lang": t.lang or "en",
+                "api_key": (t.api_key or "").strip(),
+            }
+        db.commit()
+    finally:
+        db.close()
+    return meta
+
+
+def run_translation_batch(task_ids: list) -> None:
+    """执行一批（2~3 页）翻译任务：组内并发 OCR → 合并一次 LLM 调用 → 拆分回写。
+
+    - OCR 并发度 = _BATCH_OCR_WORKERS（默认 2，PaddleOCR 吃 CPU/内存防爆）
+    - 合并翻译：几页文本拼成一个扁平数组【只调一次 LLM】（省调用次数与总等待），
+      返回等长数组后按每页条数拆分回各页；返回缺失/不等长/任一页校验不合格
+      → 整体降级逐页翻译（每页内部仍有 5 条小批量 + 逐条兜底），质量不放松
+    - 每页写自己的 result_json/缓存，前端轮询感知与单页完全一致
+    """
+    meta = _claim_for_run(task_ids)
+    ordered_ids = [tid for tid in task_ids if tid in meta]
+    if not ordered_ids:
+        return
+    print(f"[batch] 组 {ordered_ids} 开始：并发 OCR（{_BATCH_OCR_WORKERS} 线程）")
+
+    pages: dict = {}
+    with ThreadPoolExecutor(max_workers=max(1, _BATCH_OCR_WORKERS)) as pool:
+        futs = {
+            tid: pool.submit(_ocr_page, meta[tid]["url"], meta[tid]["lang"])
+            for tid in ordered_ids
+        }
+        for tid, fut in futs.items():
+            try:
+                pages[tid] = fut.result()
+            except Exception as exc:
+                pages[tid] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    # 1) 分流：缓存命中 → done；空结果 → done；OCR 失败 → 走失败重试
+    pending: list = []
+    for tid in ordered_ids:
+        p = pages[tid]
+        if "error" in p:
+            _task_fail_or_retry(tid, p["error"])
+            continue
+        if p["cached_json"]:
+            print(f"[task] #{tid} 缓存命中 hash={p['cache_key'][:16]}…，直接完成")
+            _finish_task(tid, "done", p["cached_json"])
+            continue
+        if not p["items"]:
+            _finish_task(tid, "done", "[]")
+            print(
+                f"[task] #{tid} 未识别到文字（{p['img_w']}x{p['img_h']}），"
+                "空结果完成（不写缓存）"
+            )
+            continue
+        pending.append(tid)
+
+    if not pending:
+        pages.clear()
+        gc.collect()
+        return
+
+    # 2) 合并翻译（≥2 页且总条数不超上限才合并；1 页直接走单页路径）
+    merged_done = False
+    if len(pending) >= 2:
+        merged_texts: list = []
+        offsets: dict = {}
+        for tid in pending:
+            offsets[tid] = (
+                len(merged_texts),
+                len(merged_texts) + len(pages[tid]["items"]),
+            )
+            merged_texts.extend(it["text"] for it in pages[tid]["items"])
+        if len(merged_texts) <= _MERGE_MAX_TEXTS:
+            api_key = next(
+                (meta[tid]["api_key"] for tid in pending if meta[tid]["api_key"]), ""
+            )
+            print(
+                f"[batch] 合并翻译：{len(pending)} 页共 {len(merged_texts)} 条文本，"
+                "一次调用 LLM"
+            )
+            translated = _llm_translate(merged_texts, user_api_key=api_key)
+            if translated is not None and len(translated) == len(merged_texts):
+                # 按页拆分并逐页校验中文；任一页不合格 → 整体降级，保证各页质量一致
+                ok_all = all(
+                    _result_all_chinese(
+                        [{"translated": t} for t in translated[lo:hi]]
+                    )
+                    for tid in pending
+                    for lo, hi in [offsets[tid]]
+                )
+                if ok_all:
+                    for tid in pending:
+                        lo, hi = offsets[tid]
+                        p = pages[tid]
+                        result = _build_page_result(p["img"], p["items"], translated[lo:hi])
+                        result_json = json.dumps(result, ensure_ascii=False)
+                        _cache_put(p["cache_key"], meta[tid]["url"], result)
+                        _finish_task(tid, "done", result_json)
+                        print(f"[task] #{tid} 完成（合并翻译）：{len(result)} 条气泡已回写")
+                    merged_done = True
+            if not merged_done:
+                print("[batch] 合并翻译失败/校验未过，降级为逐页翻译")
+        else:
+            print(
+                f"[batch] 合并文本 {len(merged_texts)} 条超上限 {_MERGE_MAX_TEXTS}，"
+                "直接逐页翻译"
+            )
+
+    # 3) 降级/剩余：逐页走与单页一致的翻译路径（内部含小批量+逐条兜底）
+    if not merged_done:
+        for tid in pending:
+            p = pages[tid]
+            try:
+                _translate_and_store(
+                    tid,
+                    meta[tid]["url"],
+                    p["cache_key"],
+                    p["img"],
+                    p["items"],
+                    meta[tid]["api_key"],
+                )
+            except Exception as exc:
+                _task_fail_or_retry(tid, f"{type(exc).__name__}: {exc}")
+
+    # 批次结束：彻底释放内存
+    pages.clear()
+    gc.collect()
+
+
 def _worker_tick() -> bool:
-    """worker 单轮：轮转取一个 queued 任务并串行执行。取到并执行返回 True。"""
+    """worker 单轮：轮转取任务（同 batch_id 凑组）并执行。取到并执行返回 True。"""
     from main import SessionLocal
 
     db = SessionLocal()
-    task_id: Optional[int] = None
+    task_ids: list = []
     try:
-        chosen = pick_next_task(db)
-        if chosen is None:
+        tasks = pick_next_task(db)
+        if not tasks:
             return False
         db.commit()
-        task_id = chosen.id
+        task_ids = [t.id for t in tasks]
     finally:
         db.close()
-    if task_id is not None:
-        run_translation_task(task_id)
-        return True
-    return False
+    if len(task_ids) > 1:
+        run_translation_batch(task_ids)
+    else:
+        run_translation_task(task_ids[0])
+    return True
 
 
 def _worker_loop() -> None:
     """单 worker 主循环：串行消费数据库队列，空队列时小睡。绝不并发跑 OCR。"""
-    print("[worker] 翻译任务 worker 已启动（单线程串行模式）")
+    print("[worker] 翻译任务 worker 已启动（批量合并模式：组内并发 OCR + 合并 LLM 翻译）")
     while True:
         try:
             executed = _worker_tick()
