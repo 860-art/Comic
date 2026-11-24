@@ -23,6 +23,7 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import cv2
@@ -89,68 +90,88 @@ def _get_ocr(lang: str):
     """
     with _ocr_lock:
         if lang not in _ocr_instances:
-            from paddleocr import PaddleOCR  # 延迟导入：未安装 paddle 时其它接口不受影响
-
-            # ===== 性能调优参数（2核4G 小内存服务器实测配置）=====
-            # - enable_mkldnn=True：启用 MKLDNN 加速 CPU 推理
-            # - rec_batch_num=1：识别批大小压到 1，内存峰值最低（漫画逐行识别足够）
-            # - use_angle_cls=False：漫画文字固定正向，跳过方向分类省时省内存
-            # - cpu_math_library_num_threads=2：CPU 数学库线程数对齐 2 核
-            # - det_limit_side_len=OCR_DET_SIDE_LEN（默认 1280）：大图少缩放，检出更稳
-            tuned_kwargs = dict(
-                lang=lang,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                enable_mkldnn=True,
-                rec_batch_num=1,
-                use_angle_cls=False,
-                cpu_math_library_num_threads=2,
-                det_limit_side_len=OCR_DET_SIDE_LEN,
-            )
-            # 兜底安全配置：调优参数在当前 paddle 版本不可用（初始化报错）时回退，
-            # mkldnn 关闭走纯 CPU 算子（paddle 3.3.1 onednn 存在兼容 bug 的场景）
-            safe_kwargs = dict(
-                lang=lang,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                enable_mkldnn=False,
-            )
-            try:
-                if lang == "korean":
-                    # 韩文：两个模型名都显式指定（lang 此时会被忽略，不能依赖它选 rec）
-                    _ocr_instances[lang] = PaddleOCR(
-                        text_detection_model_name=OCR_DET_MODEL,
-                        text_recognition_model_name=_KOREAN_MOBILE_REC,
-                        **tuned_kwargs,
-                    )
-                else:
-                    _ocr_instances[lang] = PaddleOCR(
-                        text_detection_model_name=OCR_DET_MODEL,
-                        text_recognition_model_name=_MOBILE_REC,
-                        **tuned_kwargs,
-                    )
-            except Exception as exc:
-                # 兜底：调优参数不可用时回退安全配置（保证功能不中断）
-                print(f"[ocr] 调优参数初始化失败，回退安全配置: {type(exc).__name__}: {exc}")
-                try:
-                    if lang == "korean":
-                        _ocr_instances[lang] = PaddleOCR(
-                            text_detection_model_name=OCR_DET_MODEL,
-                            text_recognition_model_name=_KOREAN_MOBILE_REC,
-                            **safe_kwargs,
-                        )
-                    else:
-                        _ocr_instances[lang] = PaddleOCR(
-                            text_detection_model_name=OCR_DET_MODEL,
-                            text_recognition_model_name=_MOBILE_REC,
-                            **safe_kwargs,
-                        )
-                except Exception as exc2:
-                    print(f"[ocr] Mobile 模型初始化失败，回退默认模型: {type(exc2).__name__}: {exc2}")
-                    _ocr_instances[lang] = PaddleOCR(**safe_kwargs)
+            _ocr_instances[lang] = _create_ocr(lang)
         return _ocr_instances[lang]
+
+
+def _create_ocr(lang: str):
+    """新建一个 PaddleOCR 实例（调优参数 → 安全配置 → 默认模型 三级兜底）。
+
+    独立成函数供主实例与切片检测实例复用；paddle pipeline 对象非线程安全，
+    并发 predict 必须各自持有独立实例，不能共用。
+    """
+    from paddleocr import PaddleOCR  # 延迟导入：未安装 paddle 时其它接口不受影响
+
+    # ===== 性能调优参数（2核4G 小内存服务器实测配置）=====
+    # - enable_mkldnn=True：启用 MKLDNN 加速 CPU 推理
+    # - rec_batch_num=1：识别批大小压到 1，内存峰值最低（漫画逐行识别足够）
+    # - use_angle_cls=False：漫画文字固定正向，跳过方向分类省时省内存
+    # - cpu_math_library_num_threads=2：CPU 数学库线程数对齐 2 核
+    # - det_limit_side_len=OCR_DET_SIDE_LEN（默认 960）：大图缩放控内存
+    tuned_kwargs = dict(
+        lang=lang,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        enable_mkldnn=True,
+        rec_batch_num=1,
+        use_angle_cls=False,
+        cpu_math_library_num_threads=2,
+        det_limit_side_len=OCR_DET_SIDE_LEN,
+    )
+    # 兜底安全配置：调优参数在当前 paddle 版本不可用（初始化报错）时回退，
+    # mkldnn 关闭走纯 CPU 算子（paddle 3.3.1 onednn 存在兼容 bug 的场景）
+    safe_kwargs = dict(
+        lang=lang,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        enable_mkldnn=False,
+    )
+    try:
+        if lang == "korean":
+            # 韩文：两个模型名都显式指定（lang 此时会被忽略，不能依赖它选 rec）
+            return PaddleOCR(
+                text_detection_model_name=OCR_DET_MODEL,
+                text_recognition_model_name=_KOREAN_MOBILE_REC,
+                **tuned_kwargs,
+            )
+        return PaddleOCR(
+            text_detection_model_name=OCR_DET_MODEL,
+            text_recognition_model_name=_MOBILE_REC,
+            **tuned_kwargs,
+        )
+    except Exception as exc:
+        # 兜底：调优参数不可用时回退安全配置（保证功能不中断）
+        print(f"[ocr] 调优参数初始化失败，回退安全配置: {type(exc).__name__}: {exc}")
+        try:
+            if lang == "korean":
+                return PaddleOCR(
+                    text_detection_model_name=OCR_DET_MODEL,
+                    text_recognition_model_name=_KOREAN_MOBILE_REC,
+                    **safe_kwargs,
+                )
+            return PaddleOCR(
+                text_detection_model_name=OCR_DET_MODEL,
+                text_recognition_model_name=_MOBILE_REC,
+                **safe_kwargs,
+            )
+        except Exception as exc2:
+            print(f"[ocr] Mobile 模型初始化失败，回退默认模型: {type(exc2).__name__}: {exc2}")
+            return PaddleOCR(**safe_kwargs)
+
+
+# 切片二次检测专用实例（与主实例隔离：paddle pipeline 非线程安全，并发 predict 不能共用）
+_tile_ocr_instances: dict[str, object] = {}
+_tile_ocr_lock = threading.Lock()
+
+
+def _get_tile_ocr(lang: str):
+    """切片检测专用 OCR 实例（惰性创建，每语言一个；首次创建会阻塞数秒加载模型）。"""
+    with _tile_ocr_lock:
+        if lang not in _tile_ocr_instances:
+            _tile_ocr_instances[lang] = _create_ocr(lang)
+        return _tile_ocr_instances[lang]
 
 
 def warmup_ocr(lang: str = "en") -> None:
@@ -302,29 +323,48 @@ def _dedup_ocr_items(items: list[dict]) -> list[dict]:
     return kept
 
 
-def _ocr_detect(ocr, img: np.ndarray) -> list[dict]:
+def _ocr_detect(ocr, img: np.ndarray, lang: str = "en") -> list[dict]:
     """OCR 检测：全图一次 + 上下两个重叠切片各一次（每块更小 → 内存峰值更低）。
 
     mobile_det 对铺满宽度的描边艺术字标题容易漏检；切片后文本行长宽比变正常，
     检出率明显提升。切片结果坐标加回 Y 偏移，与全图结果去重后合并。
-    任一切片失败都只忽略该片，绝不影响主流程（全图结果照常返回）。
+    提速：全图（主实例）与两个切片（独立切片实例，串行共用）【并发】跑，
+    OCR 总耗时约从 3 份压到 2 份。任一切片失败只忽略该片，绝不影响主流程；
+    全图失败则照旧向上抛（调用方按 OCR 失败处理）。
     """
-    items = _parse_ocr_result(ocr.predict(img))
-    if not OCR_TILE_DETECT or img.shape[0] < 600:
-        return items
     h = img.shape[0]
-    for y1, y2 in ((0, int(h * 0.58)), (int(h * 0.42), h)):
+    if not OCR_TILE_DETECT or h < 600:
+        return _parse_ocr_result(ocr.predict(img))
+
+    def run_full() -> list[dict]:
+        return _parse_ocr_result(ocr.predict(img))
+
+    def run_tiles() -> list[dict]:
+        out: list[dict] = []
         try:
-            tile_items = _parse_ocr_result(ocr.predict(img[y1:y2]))
+            tile_ocr = _get_tile_ocr(lang)
         except Exception as exc:
-            print(f"[ocr] 分块检测失败（忽略，不影响主流程）: {type(exc).__name__}: {exc}")
-            continue
-        for it in tile_items:
-            x, y, w, hh = it["box"]
-            it["box"] = [x, y + y1, w, hh]
-        items.extend(tile_items)
+            print(f"[ocr] 切片实例创建失败（只跑全图）: {type(exc).__name__}: {exc}")
+            return out
+        for tile, y1 in ((img[: int(h * 0.58)], 0), (img[int(h * 0.42) :], int(h * 0.42))):
+            try:
+                tile_items = _parse_ocr_result(tile_ocr.predict(tile))
+            except Exception as exc:
+                print(f"[ocr] 分块检测失败（忽略，不影响主流程）: {type(exc).__name__}: {exc}")
+                continue
+            for it in tile_items:
+                x, y, w, hh = it["box"]
+                it["box"] = [x, y + y1, w, hh]
+            out.extend(tile_items)
+        return out
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_full = pool.submit(run_full)
+        f_tiles = pool.submit(run_tiles)
+        items = f_full.result()  # 全图失败 → 抛出，主流程失败（与旧行为一致）
+        items.extend(f_tiles.result())
     merged = _dedup_ocr_items(items)
-    print(f"[ocr] 分块二次检测：{len(items)} 个框去重后 {len(merged)} 个")
+    print(f"[ocr] 全图+分块并发检测：{len(items)} 个框去重后 {len(merged)} 个")
     return merged
 
 
@@ -1060,7 +1100,7 @@ async def translate_comic(request: Request):
         if not acquired:
             raise HTTPException(status_code=503, detail="OCR 排队超时（服务繁忙），请稍后重试")
         try:
-            items = _ocr_detect(ocr, img)
+            items = _ocr_detect(ocr, img, lang)
         finally:
             _ocr_semaphore.release()
     except HTTPException:
@@ -1327,8 +1367,10 @@ async def ocr_batch(request: Request):
 
 # 首次执行 + 最多 2 次重试 = 共 3 次尝试，超过即 failed 终态
 TASK_MAX_ATTEMPTS = 3
-# LLM 翻译小批量：OCR 之后按批串行翻译，避免一次大 payload 超时
-TRANSLATE_BATCH_SIZE = 5
+# LLM 翻译批量：一次调用翻更多条，减少 HTTP 往返（20 条/页从 4 次调用降到 2 次）。
+# 模型响应等待时间远大于 token 处理时间，加大批量是单页提速的最大头；
+# 批内失败仍自动降级逐条翻译，质量保护不变。14 条约 1.5k 字符 payload 安全
+TRANSLATE_BATCH_SIZE = max(1, int(os.getenv("TRANSLATE_BATCH_SIZE", "14") or "14"))
 # 队列空转轮询间隔（秒）
 _WORKER_IDLE_SLEEP = 1.5
 
@@ -1515,7 +1557,7 @@ def _ocr_page(task_url: str, task_lang: str) -> dict:
     if not acquired:
         raise RuntimeError(f"OCR 排队超时（{_OCR_QUEUE_TIMEOUT}s）")
     try:
-        items = _ocr_detect(ocr, img)
+        items = _ocr_detect(ocr, img, task_lang)
     finally:
         _ocr_semaphore.release()
 
