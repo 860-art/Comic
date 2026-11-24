@@ -105,7 +105,9 @@ def _create_ocr(lang: str):
     # ===== 性能调优参数（2核4G 小内存服务器实测配置）=====
     # - enable_mkldnn=True：启用 MKLDNN 加速 CPU 推理
     # - rec_batch_num=1：识别批大小压到 1，内存峰值最低（漫画逐行识别足够）
-    # - use_angle_cls=False：漫画文字固定正向，跳过方向分类省时省内存
+    # - use_textline_orientation=False：漫画文字固定正向，跳过方向分类省时省内存
+    #   （PaddleOCR 3.x 已用此参数取代 use_angle_cls；两者同时传会抛
+    #    ValueError: mutually exclusive，导致整套调优参数初始化失败、回退最慢配置）
     # - cpu_math_library_num_threads=2：CPU 数学库线程数对齐 2 核
     # - det_limit_side_len=OCR_DET_SIDE_LEN（默认 960）：大图缩放控内存
     tuned_kwargs = dict(
@@ -115,7 +117,6 @@ def _create_ocr(lang: str):
         use_textline_orientation=False,
         enable_mkldnn=True,
         rec_batch_num=1,
-        use_angle_cls=False,
         cpu_math_library_num_threads=2,
         det_limit_side_len=OCR_DET_SIDE_LEN,
     )
@@ -379,13 +380,21 @@ def _filter_items(items: list[dict], img: np.ndarray) -> list[dict]:
 
     - box 宽度 > 图片宽度 × MAX_BOX_WIDTH_RATIO，或高度 > 图片高度 × MAX_BOX_HEIGHT_RATIO → 跳过
     - 有效字符数（去标点/空白）< MIN_MEANINGFUL_CHARS → 跳过（不翻译、不取色、不返回）
+    - 纯数字/纯符号（页码 "02"、序号、分隔线）→ 跳过：LLM 无法译成中文，
+      送进去会因中文校验失败导致整批降级、逐条仍失败、整页放弃（实测任务重试 3 次全挂）
     """
     img_h, img_w = img.shape[:2]
     kept: list[dict] = []
     skipped = 0
     for it in items:
         _, _, w, h = it["box"]
-        meaningful_chars = len(_PUNCT_RE.sub("", it["text"]))
+        meaningful = _PUNCT_RE.sub("", it["text"])
+        meaningful_chars = len(meaningful)
+        # 纯数字（如页码 '02'）或去标点后全为空 → 不参与翻译、不生成气泡
+        if not meaningful or meaningful.isdigit():
+            skipped += 1
+            print(f"[translate]   跳过纯数字/符号（页码等）: {it['text']!r}")
+            continue
         if w > img_w * MAX_BOX_WIDTH_RATIO or h > img_h * MAX_BOX_HEIGHT_RATIO:
             # 超宽/超高框：长句是封面标题、章节横幅或长旁白 → 放行翻译；
             # 只有短短几个字的巨型拟声词（악、ドン）才跳过，避免遮挡画面
