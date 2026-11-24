@@ -56,12 +56,17 @@ LONG_BANNER_MIN_CHARS = 8
 
 # ===== OCR 懒加载单例（按语言缓存；启动预热 + 首次调用兜底） =====
 # PaddleOCR 3.x 返回结构各模型一致（rec_texts 等 dict），下游解析零改动。
-# 检测模型：mobile_det 对大号描边/渐变艺术字标题漏检明显（用户实测整行标题无气泡），
-# 升级 server_det（~85MB）显著提升检出率；现为一张一张串行翻译，内存可承受。
-# 环境变量 OCR_DET_MODEL=PP-OCRv5_mobile_det 可回退轻量模型（内存吃紧时）。
-OCR_DET_MODEL = os.getenv("OCR_DET_MODEL", "PP-OCRv5_server_det") or "PP-OCRv5_server_det"
-# 检测输入边长上限：960 → 1280（大图缩放更少，小字/复杂排版检出更稳）
-OCR_DET_SIDE_LEN = max(640, int(os.getenv("OCR_DET_SIDE_LEN", "1280") or "1280"))
+# 【重要】server_det（~85MB）在 2核4G 容器实测推理抛 MemoryError（任务 3 次重试全失败）。
+# 默认恢复 mobile_det（~5MB）先保证可用；大标题检出改由下方低内存「分块二次检测」补足。
+# 仅内存充足的服务器可显式设 OCR_DET_MODEL=PP-OCRv5_server_det 启用大模型。
+OCR_DET_MODEL = os.getenv("OCR_DET_MODEL", "PP-OCRv5_mobile_det") or "PP-OCRv5_mobile_det"
+# 检测输入边长保持 960（1280 会进一步抬高内存峰值）
+OCR_DET_SIDE_LEN = max(640, int(os.getenv("OCR_DET_SIDE_LEN", "960") or "960"))
+# 低内存分块二次检测：全图 OCR 后上下切两块各再跑一次（每块更小 → 峰值更低），
+# 补齐 mobile_det 漏检的大号描边标题，结果按 IoU/文本去重合并。设 0 可关闭。
+OCR_TILE_DETECT = (os.getenv("OCR_TILE_DETECT", "1") or "1").strip().lower() not in (
+    "0", "false", "no",
+)
 _MOBILE_REC = "PP-OCRv5_mobile_rec"          # 通用字典：中/英/日文假名
 _KOREAN_MOBILE_REC = "korean_PP-OCRv5_mobile_rec"  # 韩文专用轻量模型（通用字典不含韩文）
 
@@ -263,6 +268,64 @@ def _parse_ocr_result(raw) -> list[dict]:
         except Exception:
             continue
     return items
+
+
+# ===== 低内存分块二次检测 =====
+def _box_iou(a: list, b: list) -> float:
+    """两个 [x, y, w, h] 框的交并比。"""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    iw = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    ih = max(0, min(ay + ah, by + bh) - max(ay, by))
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _dedup_ocr_items(items: list[dict]) -> list[dict]:
+    """全图与切片结果的重复框去重：同位置（IoU>0.55）或位置接近且文本包含 → 只留高置信度那条。"""
+    kept: list[dict] = []
+    for it in sorted(items, key=lambda x: -float(x.get("conf") or 0)):
+        t = re.sub(r"\W+", "", it.get("text") or "", flags=re.UNICODE).lower()
+        dup = False
+        for k in kept:
+            iou = _box_iou(it["box"], k["box"])
+            kt = re.sub(r"\W+", "", k.get("text") or "", flags=re.UNICODE).lower()
+            same_text = bool(t) and (t == kt or t in kt or kt in t)
+            if iou > 0.55 or (iou > 0.1 and same_text):
+                dup = True
+                break
+        if not dup:
+            kept.append(it)
+    return kept
+
+
+def _ocr_detect(ocr, img: np.ndarray) -> list[dict]:
+    """OCR 检测：全图一次 + 上下两个重叠切片各一次（每块更小 → 内存峰值更低）。
+
+    mobile_det 对铺满宽度的描边艺术字标题容易漏检；切片后文本行长宽比变正常，
+    检出率明显提升。切片结果坐标加回 Y 偏移，与全图结果去重后合并。
+    任一切片失败都只忽略该片，绝不影响主流程（全图结果照常返回）。
+    """
+    items = _parse_ocr_result(ocr.predict(img))
+    if not OCR_TILE_DETECT or img.shape[0] < 600:
+        return items
+    h = img.shape[0]
+    for y1, y2 in ((0, int(h * 0.58)), (int(h * 0.42), h)):
+        try:
+            tile_items = _parse_ocr_result(ocr.predict(img[y1:y2]))
+        except Exception as exc:
+            print(f"[ocr] 分块检测失败（忽略，不影响主流程）: {type(exc).__name__}: {exc}")
+            continue
+        for it in tile_items:
+            x, y, w, hh = it["box"]
+            it["box"] = [x, y + y1, w, hh]
+        items.extend(tile_items)
+    merged = _dedup_ocr_items(items)
+    print(f"[ocr] 分块二次检测：{len(items)} 个框去重后 {len(merged)} 个")
+    return merged
 
 
 # ===== 大尺寸/无效文本框过滤 =====
@@ -997,10 +1060,9 @@ async def translate_comic(request: Request):
         if not acquired:
             raise HTTPException(status_code=503, detail="OCR 排队超时（服务繁忙），请稍后重试")
         try:
-            raw_result = ocr.predict(img)
+            items = _ocr_detect(ocr, img)
         finally:
             _ocr_semaphore.release()
-        items = _parse_ocr_result(raw_result)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1448,16 +1510,15 @@ def _ocr_page(task_url: str, task_lang: str) -> dict:
             pass
 
     ocr = _get_ocr(task_lang)
-    # 信号量保护：batch 内并发线程与旧同步接口 /api/translate 共用同一实例
+    # 信号量保护：worker 与旧同步接口 /api/translate 共用同一实例
     acquired = _ocr_semaphore.acquire(timeout=_OCR_QUEUE_TIMEOUT)
     if not acquired:
         raise RuntimeError(f"OCR 排队超时（{_OCR_QUEUE_TIMEOUT}s）")
     try:
-        raw = ocr.predict(img)
+        items = _ocr_detect(ocr, img)
     finally:
         _ocr_semaphore.release()
 
-    items = _parse_ocr_result(raw)
     items = _filter_items(items, img)
     items = _merge_bubble_lines(items) if items else []
     items = strip_watermark_items(items)  # 水印/网址气泡不参与翻译，避免整页被拖垮
