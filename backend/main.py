@@ -720,6 +720,9 @@ def create_translation_task(
         if task.status in ("queued", "processing"):
             # 幂等：直接返回同一 task_id，绝不重复入队；顺手补上 Key 与组标识
             # （旧前端提交的任务没有 batch_id，新前端重进页面时补齐即可凑组）
+            # 预热任务（系统 user_id=0）正被用户等待 → 归属到该用户，调度优先级随之提升
+            if task.status == "queued" and task.user_id == PRETRANSLATE_USER_ID:
+                task.user_id = user.id
             if api_key or batch_id:
                 if api_key:
                     task.api_key = api_key
@@ -1450,6 +1453,60 @@ def admin_pending_list(
     return [pending_to_dict(p) for p in rows]
 
 
+# ===== 审核通过后的翻译预热（后台预翻译） =====
+# 系统预翻译任务的身份 user_id（真实用户自增 id 从 1 开始，0 不会冲突）。
+# worker 调度保证用户手动提交的任务优先于系统预热任务（见 pick_next_task）。
+PRETRANSLATE_USER_ID = 0
+
+
+def enqueue_pretranslate_tasks(comic_id: int, chapters, db: Session) -> int:
+    """章节上架后把每章每页排队为后台预翻译任务（缓存预热）。
+
+    - 用户打开阅读页时正常提交翻译任务：预热已 done → 幂等直接返回结果（秒开）；
+      预热还在排队 → 返回同一 task_id 继续等，绝不重复执行
+    - 防重：同一 (comic_id, page_id, target_lang) 已有任何任务记录 → 跳过（唯一约束兜底）
+    - 排队防 OOM：worker 单线程一张一张串行，多章节自动排队，OCR 绝无并发
+    - lang 与前端阅读页一致写 "en"（前端写死）；翻译缓存按图片内容 hash 命中
+    - user_id=0 系统身份：不走提交接口，不受「每用户 1 个进行中任务」限制
+    返回新入队页数（0 = 该章节此前已入过队 / 无图片）。
+    """
+    queued = 0
+    for ch in chapters:
+        images = json.loads(ch.images or "[]")
+        for i, src in enumerate(images):
+            page_id = f"{ch.id}:{i}"[:128]
+            exists = (
+                db.query(TranslationTask)
+                .filter(
+                    TranslationTask.comic_id == comic_id,
+                    TranslationTask.page_id == page_id,
+                    TranslationTask.target_lang == "zh",
+                )
+                .first()
+            )
+            if exists:
+                continue
+            db.add(
+                TranslationTask(
+                    comic_id=comic_id,
+                    page_id=page_id,
+                    target_lang="zh",
+                    lang="en",
+                    image_url=src,
+                    status="queued",
+                    user_id=PRETRANSLATE_USER_ID,
+                )
+            )
+            queued += 1
+    if queued:
+        db.commit()
+        print(
+            f"[pretranslate] 漫画 {comic_id} 翻译预热入队 {queued} 页"
+            "（后台一张一张串行，多章节自动排队）"
+        )
+    return queued
+
+
 @app.post("/api/admin/comics/{comic_id}/review")
 def review_comic(
     comic_id: int,
@@ -1503,6 +1560,8 @@ def review_comic(
             )
             db.commit()
             db.refresh(target)  # 刷新 relationship，让返回的章节列表包含新章
+            # 翻译预热：新章节逐页排队后台预翻译，用户打开时命中缓存秒出
+            enqueue_pretranslate_tasks(target.id, target.chapters, db)
             return {
                 "message": f"已通过！{len(added_chapters)} 个章节已追加到《{target.title}》",
                 "comic_id": target.id,
@@ -1552,6 +1611,8 @@ def review_comic(
         )
         db.commit()
         db.refresh(comic)
+        # 翻译预热：整本逐章逐页排队后台预翻译（多章节自动排队，worker 串行防 OOM）
+        enqueue_pretranslate_tasks(comic.id, comic.chapters, db)
         return {
             "message": "已通过并发布！",
             "comic_id": comic.id,

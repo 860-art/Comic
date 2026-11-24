@@ -1427,9 +1427,16 @@ def _llm_translate_serial(
     return out
 
 
+# 系统翻译预热任务的 user_id（必须与 main.PRETRANSLATE_USER_ID 一致；
+# 本模块不能顶层 import main（循环导入），故这里重复定义常量）
+_PRETRANSLATE_USER_ID = 0
+
+
 def pick_next_task(db):
     """按用户轮转（round-robin）取下一个 queued 任务，保证多用户公平。
 
+    - 用户手动提交的任务（user_id>0）优先于系统翻译预热任务（user_id=0）：
+      没有任何普通用户的 queued 任务时才处理预热队列——有人在等就先翻人要的
     - queued 任务按 created_at 升序分组到各用户名下（每用户取最旧的一个）
     - 全局游标 _rr_last_user 记录上次调度的用户，本次从它的下一位用户开始转
     - 取到即标记 processing（由调用方 commit），天然防止重复取
@@ -1439,12 +1446,20 @@ def pick_next_task(db):
     from sqlalchemy import asc
 
     TranslationTask = _load_task_model()
+    query = db.query(TranslationTask).filter(TranslationTask.status == "queued")
+    order = (asc(TranslationTask.created_at), asc(TranslationTask.id))
+    # 先取普通用户任务；一个都没有时才轮到系统预热队列（user_id=0）
     rows = (
-        db.query(TranslationTask)
-        .filter(TranslationTask.status == "queued")
-        .order_by(asc(TranslationTask.created_at), asc(TranslationTask.id))
+        query.filter(TranslationTask.user_id != _PRETRANSLATE_USER_ID)
+        .order_by(*order)
         .all()
     )
+    if not rows:
+        rows = (
+            query.filter(TranslationTask.user_id == _PRETRANSLATE_USER_ID)
+            .order_by(*order)
+            .all()
+        )
     if not rows:
         return None
 
