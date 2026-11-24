@@ -1459,17 +1459,24 @@ def admin_pending_list(
 PRETRANSLATE_USER_ID = 0
 
 
-def enqueue_pretranslate_tasks(comic_id: int, chapters, db: Session) -> int:
+def enqueue_pretranslate_tasks(
+    comic_id: int, chapters, db: Session, need_translation: bool | None = None
+) -> int:
     """章节上架后把每章每页排队为后台预翻译任务（缓存预热）。
 
+    - 前提：投稿时选了「需要 AI 翻译」。need_translation=False → 直接跳过不预热
+      （与阅读页一致：仅明确 false 隐藏翻译按钮，true 或老数据缺失都显示）
     - 用户打开阅读页时正常提交翻译任务：预热已 done → 幂等直接返回结果（秒开）；
       预热还在排队 → 返回同一 task_id 继续等，绝不重复执行
     - 防重：同一 (comic_id, page_id, target_lang) 已有任何任务记录 → 跳过（唯一约束兜底）
     - 排队防 OOM：worker 单线程一张一张串行，多章节自动排队，OCR 绝无并发
     - lang 与前端阅读页一致写 "en"（前端写死）；翻译缓存按图片内容 hash 命中
     - user_id=0 系统身份：不走提交接口，不受「每用户 1 个进行中任务」限制
-    返回新入队页数（0 = 该章节此前已入过队 / 无图片）。
+    返回新入队页数（0 = 不需要翻译 / 该章节此前已入过队 / 无图片）。
     """
+    if need_translation is False:
+        print(f"[pretranslate] 漫画 {comic_id} 投稿未选 AI 翻译，跳过预热")
+        return 0
     queued = 0
     for ch in chapters:
         images = json.loads(ch.images or "[]")
@@ -1561,7 +1568,10 @@ def review_comic(
             db.commit()
             db.refresh(target)  # 刷新 relationship，让返回的章节列表包含新章
             # 翻译预热：新章节逐页排队后台预翻译，用户打开时命中缓存秒出
-            enqueue_pretranslate_tasks(target.id, target.chapters, db)
+            # （仅投稿选了「需要 AI 翻译」才预热；append 时 1479 行已同步该标志）
+            enqueue_pretranslate_tasks(
+                target.id, target.chapters, db, target.need_translation
+            )
             return {
                 "message": f"已通过！{len(added_chapters)} 个章节已追加到《{target.title}》",
                 "comic_id": target.id,
@@ -1612,7 +1622,8 @@ def review_comic(
         db.commit()
         db.refresh(comic)
         # 翻译预热：整本逐章逐页排队后台预翻译（多章节自动排队，worker 串行防 OOM）
-        enqueue_pretranslate_tasks(comic.id, comic.chapters, db)
+        # （仅投稿选了「需要 AI 翻译」才预热，1531 行建 comic 时已带入该标志）
+        enqueue_pretranslate_tasks(comic.id, comic.chapters, db, comic.need_translation)
         return {
             "message": "已通过并发布！",
             "comic_id": comic.id,
