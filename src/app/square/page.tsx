@@ -3,7 +3,7 @@
 
 import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { AtSign, ChevronDown, ChevronUp, Flame, Heart, MessageCircle } from "lucide-react";
+import { AtSign, Flame, Heart, MessageCircle } from "lucide-react";
 import CommentDrawer, { type CommentItem } from "@/components/CommentDrawer";
 import {
   ME_ID,
@@ -152,16 +152,11 @@ function savePostComments(postId: string, list: CommentItem[]) {
 /** 单篇文章视图（每次切换文章都会重新挂载，滚动位置与吸顶状态自动重置） */
 function FeedView({
   post,
-  index,
-  total,
-  onPrev,
-  onNext,
+  onSwipe,
 }: {
   post: SocialPost;
-  index: number;
-  total: number;
-  onPrev: () => void;
-  onNext: () => void;
+  /** 短视频式手势回调："next" 上一篇→下一篇，"prev" 反之 */
+  onSwipe: (dir: "next" | "prev") => void;
 }) {
   const router = useRouter();
   const [liked, setLiked] = useState(false);
@@ -370,6 +365,53 @@ function FeedView({
   };
 
   // 轮播页码：几何最近邻计算当前居中的图片
+  // ===== 短视频式上下滑动切换文章 =====
+  // 触屏：上滑（内容已在底部）→ 下一篇，下滑（内容在顶部）→ 上一篇；
+  // 桌面：滚轮同理（700ms 节流防连跳）。文章内部还能滚时手势归内容区，不切篇。
+  const touchStart = useRef<{ y: number; scroll: number } | null>(null);
+  const wheelLock = useRef(0);
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    touchStart.current = {
+      y: e.touches[0].clientY,
+      scroll: scrollRef.current?.scrollTop ?? 0,
+    };
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent) => {
+    const start = touchStart.current;
+    touchStart.current = null;
+    if (!start) return;
+    const dy = e.changedTouches[0].clientY - start.y;
+    if (Math.abs(dy) < 60) return; // 太短视为误触（横向滑轮播等）
+    // 触摸期间内部发生了垂直滚动（在看长文/评论）→ 本次手势归内容区
+    if (Math.abs((scrollRef.current?.scrollTop ?? 0) - start.scroll) > 8) return;
+    const scroller = scrollRef.current;
+    const atBottom =
+      !scroller ||
+      scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
+    const atTop = !scroller || scroller.scrollTop <= 2;
+    if (dy < 0 && atBottom) onSwipe("next");
+    else if (dy > 0 && atTop) onSwipe("prev");
+  };
+
+  const handleFeedWheel = (e: React.WheelEvent) => {
+    const now = Date.now();
+    if (now - wheelLock.current < 700) return; // 滚轮一格会连发多次事件
+    if (Math.abs(e.deltaY) < 20) return;
+    const scroller = scrollRef.current;
+    if (scroller && scroller.scrollHeight > scroller.clientHeight) {
+      const atBottom =
+        scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
+      const atTop = scroller.scrollTop <= 2;
+      if (e.deltaY > 0 && !atBottom) return; // 内部还能往下滚
+      if (e.deltaY < 0 && !atTop) return; // 内部还能往上滚
+    }
+    wheelLock.current = now;
+    if (e.deltaY > 0) onSwipe("next");
+    else onSwipe("prev");
+  };
+
   const handleCarouselScroll = () => {
     if (rafRef.current !== null) return;
     rafRef.current = requestAnimationFrame(() => {
@@ -396,41 +438,25 @@ function FeedView({
     "rounded-full border border-white/20 bg-black/40 text-white backdrop-blur-md";
 
   return (
-    <div className="relative h-full">
+    <div
+      className="relative h-full"
+      onTouchStart={handleTouchStart}
+      onTouchEnd={handleTouchEnd}
+      onWheel={handleFeedWheel}
+    >
+      {/* 切换动画 keyframes（挂载即播一次；key=文章 id 重挂载时自动触发） */}
+      <style>{`@keyframes feedSlideIn{from{opacity:0;transform:translateY(28px)}to{opacity:1;transform:translateY(0)}}`}</style>
       {/* 全屏模糊背景：当前文章第一张图 */}
       <BlurredBackground src={post.images[0]} />
-
-      {/* 屏幕左下角横排悬浮：玻璃态上/下切换按钮，超出范围置灰禁用 */}
-      <div className="fixed bottom-6 left-4 z-50 flex gap-3">
-        <button
-          type="button"
-          aria-label="上一篇文章"
-          onClick={onPrev}
-          disabled={index === 0}
-          className={`flex h-11 w-11 items-center justify-center rounded-full border border-white/20 bg-black/40 text-white backdrop-blur-md transition-all active:scale-90 ${
-            index === 0 ? "cursor-not-allowed opacity-30" : "hover:bg-black/55"
-          }`}
-        >
-          <ChevronUp className="h-5 w-5" />
-        </button>
-        <button
-          type="button"
-          aria-label="下一篇文章"
-          onClick={onNext}
-          disabled={index === total - 1}
-          className={`flex h-11 w-11 items-center justify-center rounded-full border border-white/20 bg-black/40 text-white backdrop-blur-md transition-all active:scale-90 ${
-            index === total - 1 ? "cursor-not-allowed opacity-30" : "hover:bg-black/55"
-          }`}
-        >
-          <ChevronDown className="h-5 w-5" />
-        </button>
-      </div>
 
       {/* 文章内容区：允许向下滚动阅读 */}
       <div ref={scrollRef} className="h-full overflow-y-auto">
         {/* 单篇文章白毛玻璃卡片 */}
         <div className="mx-auto max-w-3xl px-4 py-6">
-          <article className="overflow-hidden rounded-3xl border border-white/50 bg-white/60 shadow-[0_8px_32px_0_rgba(31,38,135,0.1)] backdrop-blur-2xl">
+          <article
+            className="overflow-hidden rounded-3xl border border-white/50 bg-white/60 shadow-[0_8px_32px_0_rgba(31,38,135,0.1)] backdrop-blur-2xl"
+            style={{ animation: "feedSlideIn 260ms ease-out" }}
+          >
             {/* 图片轮播 + 悬浮角标/按钮（纯文字动态显示渐变占位） */}
             <div className="relative">
               {post.images.length > 0 ? (
@@ -689,16 +715,20 @@ function SquareFeed() {
   }
 
   return (
-    /* 页面外层：固定高度、隐藏溢出，滚动只发生在文章内容区内部 */
+    /* 页面外层：固定高度、隐藏溢出，滚动只发生在文章内容区内部；
+       切换方式：触屏上下滑动 / 桌面滚轮（手势在 FeedView 内，滚到底/顶再滑才切篇） */
     <div className="h-[calc(100vh-3.5rem)] overflow-hidden">
       {/* key = 文章 id：切换时整棵子树重新挂载，滚动位置与吸顶状态自动重置 */}
       <FeedView
         key={post.id}
         post={post}
-        index={activeIndex}
-        total={posts.length}
-        onPrev={() => setActiveIndex((i) => Math.max(0, i - 1))}
-        onNext={() => setActiveIndex((i) => Math.min(posts.length - 1, i + 1))}
+        onSwipe={(dir) =>
+          setActiveIndex((i) =>
+            dir === "next"
+              ? Math.min(posts.length - 1, i + 1)
+              : Math.max(0, i - 1)
+          )
+        }
       />
     </div>
   );
