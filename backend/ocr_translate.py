@@ -149,8 +149,8 @@ def _create_ocr(lang: str):
     # ===== 性能调优参数（2核4G 小内存服务器）=====
     # - enable_mkldnn=True：启用 MKLDNN 加速 CPU 推理
     # - 识别批大小压到 1：内存峰值最低（漫画逐行识别足够）
-    # - 检测边长 OCR_DET_SIDE_LEN（默认 960）：长图 720x5000 不再按默认
-    #   4000 缩放推理，提速且省内存
+    # - 检测边长 OCR_DET_SIDE_LEN（默认 960）：限制检测输入尺寸，
+    #   长图（如 720x5000）推理量更小、峰值内存更低
     # - use_textline_orientation=False：漫画文字固定正向，跳过方向分类省时省内存
     #   （3.x 已取代 use_angle_cls；两者同时传会 mutually exclusive）
     # - 参数名 2.x/3.x 差异极大：3.x 用 text_det_limit_side_len /
