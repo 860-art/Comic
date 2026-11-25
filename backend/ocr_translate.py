@@ -633,13 +633,32 @@ _WATERMARK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# OCR 常把域名里的点吞掉：MRSON.ORG → "MRSONORG"、MAGUSTOON.ORG → "MAGUSTOONORG"。
+# 这类紧凑域名没有点号，_WATERMARK_RE 匹配不到，送进 LLM 后模型忠实返回原文、
+# 中文校验失败 → 整页放弃（实测任务 #185 重试 3 次）。这里单独识别：
+# 单个纯字母数字 token + 域名后缀，且前缀至少 4 字符。
+# 前缀要求 4 而非 3：放宽到 3 会把 PLANET（PLA+NET）等正常台词误杀；
+# 短前缀水印（XXXCOM）由「单条译不出就跳过」兜底，不影响整页。
+# 刻意不含 me/io/co/cc 等短后缀（会误杀 WELCOME / STUDIO 等正常台词）。
+_COMPACT_DOMAIN_RE = re.compile(
+    r"[A-Za-z0-9]{4,}(?:org|com|net|xyz|top|site|club|shop|tv|info|biz|kr|jp|cn)",
+    re.IGNORECASE,
+)
+
 
 def strip_watermark_items(items: list[dict]) -> list[dict]:
     """剔除含网址/域名/邮箱的水印推广气泡（保留正常对白），并打印剔除数量便于排查。"""
     if not items:
         return items
-    kept = [it for it in items if not _WATERMARK_RE.search(str(it.get("text") or ""))]
-    removed = len(items) - len(kept)
+    kept: list[dict] = []
+    removed = 0
+    for it in items:
+        text = str(it.get("text") or "").strip()
+        if _WATERMARK_RE.search(text) or _COMPACT_DOMAIN_RE.fullmatch(text):
+            removed += 1
+            print(f"[watermark] 剔除水印文本: {text!r}")
+            continue
+        kept.append(it)
     if removed:
         print(f"[watermark] 剔除 {removed} 个含网址/域名的水印气泡（不参与翻译）")
     return kept
@@ -1416,15 +1435,19 @@ _rr_lock = threading.Lock()
 
 def _llm_translate_serial(
     texts: list[str], user_api_key: str = "", batch_size: int = TRANSLATE_BATCH_SIZE
-) -> Optional[list[str]]:
+) -> Optional[list[Optional[str]]]:
     """OCR 之后小批量串行翻译：按 batch_size 切片逐批调 LLM，批间不并发。
 
-    每批沿用 _llm_translate 的中文校验 + 温度重试。整批失败时（常见于一批里混了
-    拟声词/人名/单字母短句，模型返回原文或 JSON 少一条），自动**降级为逐条翻译**：
-    单条短文本单独问模型成功率高得多，1 条难翻不再毁掉整页。
-    逐条仍失败才整页返回 None（绝不写部分结果、不写脏译文）。
+    返回与 texts 等长的数组，译不出的位置为 None（调用方丢掉该气泡即可）。
+    每批沿用 _llm_translate 的中文校验 + 温度重试。整批失败时（批次里混了
+    水印/页码/拟声词，模型返回原文）自动降级为逐条翻译：
+    - 单条仍失败的（噪声文本）→ 跳过该条，其余译文照常回写、正常写缓存。
+      绝不再「整页放弃」：实测一条水印 'MRSONORG' 导致整页失败 + 重试 3 次，
+      每次重跑 60+ 秒 OCR，前面已成功的译文全部白费。
+    - 整批【全部】条目都失败 → 说明是真故障（Key 无效/网络/全页无法翻译），
+      返回 None 走任务重试，绝不静默写出空结果。
     """
-    out: list[str] = []
+    out: list[Optional[str]] = []
     for start in range(0, len(texts), batch_size):
         chunk = texts[start : start + batch_size]
         batch_no = start // batch_size + 1
@@ -1439,17 +1462,27 @@ def _llm_translate_serial(
                 f"[task] 小批量翻译第 {batch_no} 批（{len(chunk)} 条）整批失败，"
                 f"降级为逐条翻译重试: {chunk!r}"
             )
-            recovered: list[str] = []
+            recovered: list[Optional[str]] = []
+            failed = 0
             for j, single in enumerate(chunk):
                 one = _llm_translate([single], user_api_key)
                 if one is None or len(one) != 1:
+                    failed += 1
                     print(
-                        f"[task] 第 {batch_no} 批第 {j + 1} 条逐条重试仍失败: {single!r}，整页放弃"
+                        f"[task] 第 {batch_no} 批第 {j + 1} 条译不出（水印/页码/乱码），"
+                        f"跳过该条不拖垮整页: {single!r}"
                     )
-                    return None
-                recovered.extend(one)
+                    recovered.append(None)
+                else:
+                    recovered.extend(one)
+            if failed == len(chunk):
+                print(f"[task] 第 {batch_no} 批全部条目译不出 → 真故障，走任务重试")
+                return None
             translated = recovered
-            print(f"[task] 第 {batch_no} 批逐条重试全部成功（{len(recovered)} 条）")
+            print(
+                f"[task] 第 {batch_no} 批逐条重试完成：成功 {len(chunk) - failed} 条，"
+                f"跳过 {failed} 条噪声"
+            )
         out.extend(translated)
     return out
 
@@ -1668,11 +1701,24 @@ def _translate_and_store(
             "（Key 无效 / 额度不足 / 超时 / 返回了原文），详见服务器日志 [translate]"
         )
 
-    result = _build_page_result(img, items, translated)
-    result_json = json.dumps(result, ensure_ascii=False)
-    _cache_put(cache_key, task_url, result)
-    _finish_task(task_id, "done", result_json)
-    print(f"[task] #{task_id} 完成：{len(result)} 条气泡已回写 result_json")
+    # 译不出的条目（水印/页码/乱码）位置为 None：同步丢弃该气泡，
+    # 保证 items 与 translated 一一对齐，绝不生成「原文=译文」的脏气泡
+    pairs = [(it, tr) for it, tr in zip(items, translated) if tr is not None]
+    if pairs:
+        kept_items, kept_translated = zip(*pairs)
+        result = _build_page_result(img, list(kept_items), list(kept_translated))
+    else:
+        # 整页都是噪声 → 空结果是合法完成态（与「未识别到文字」一致，不写缓存）
+        result = []
+    if result:
+        result_json = json.dumps(result, ensure_ascii=False)
+        _cache_put(cache_key, task_url, result)
+        _finish_task(task_id, "done", result_json)
+        print(f"[task] #{task_id} 完成：{len(result)} 条气泡已回写 result_json")
+    else:
+        # 空结果不写缓存：下次仍有机会重新识别，不被一次漏检永久锁死
+        _finish_task(task_id, "done", "[]")
+        print(f"[task] #{task_id} 全部条目无法翻译，空结果完成（不写缓存）")
 
 
 def run_translation_task(task_id: int) -> None:
