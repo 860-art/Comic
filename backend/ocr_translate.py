@@ -21,10 +21,20 @@ import gc
 import hashlib
 import json
 import os
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+
+# systemd 直接跑 uvicorn（stdout 走管道）时 Python 默认块缓冲：worker 的 print
+# 会攒几 KB 才刷出，journalctl -f 看不到实时进度（容易被误判为「卡死」）。
+# 强制行缓冲：每条日志立即落盘，不依赖部署时是否设置 PYTHONUNBUFFERED。
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 import cv2
 import numpy as np
@@ -1750,6 +1760,24 @@ def _recover_stuck_tasks() -> None:
         db.close()
 
 
+def _queue_heartbeat() -> None:
+    """打印队列状态摘要：排查「卡住」时一眼看出 worker 是否活着、队列是否推进。"""
+    from main import SessionLocal
+    from sqlalchemy import func
+
+    db = SessionLocal()
+    try:
+        TranslationTask = _load_task_model()
+        counts = dict(
+            db.query(TranslationTask.status, func.count(TranslationTask.id))
+            .group_by(TranslationTask.status)
+            .all()
+        )
+        print(f"[worker] 心跳：队列状态 {counts or '{}'}")
+    finally:
+        db.close()
+
+
 def _worker_loop() -> None:
     """单 worker 主循环：串行消费数据库队列，空队列时小睡。绝不并发跑 OCR。"""
     print("[worker] 翻译任务 worker 已启动（单页串行模式：一张一张翻译）")
@@ -1757,12 +1785,19 @@ def _worker_loop() -> None:
         _recover_stuck_tasks()
     except Exception as exc:
         print(f"[worker] 启动恢复失败（不影响主循环）: {type(exc).__name__}: {exc}")
+    last_heartbeat = 0.0
     while True:
         try:
             executed = _worker_tick()
         except Exception as exc:
             print(f"[worker] 单轮异常（继续下一轮）: {type(exc).__name__}: {exc}")
             executed = False
+        if time.time() - last_heartbeat >= 60:
+            last_heartbeat = time.time()
+            try:
+                _queue_heartbeat()
+            except Exception as exc:
+                print(f"[worker] 心跳查询失败（忽略）: {type(exc).__name__}: {exc}")
         if not executed:
             time.sleep(_WORKER_IDLE_SLEEP)
 
