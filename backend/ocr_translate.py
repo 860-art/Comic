@@ -21,6 +21,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -38,7 +39,6 @@ except Exception:
 
 import cv2
 import numpy as np
-import re
 import requests
 from fastapi import APIRouter, HTTPException, Request
 
@@ -104,6 +104,35 @@ def _get_ocr(lang: str):
         return _ocr_instances[lang]
 
 
+def _build_ocr_adaptive(kwargs: dict):
+    """构造 PaddleOCR，自动剔除当前版本不认识的旧参数（跨版本自适应）。
+
+    PaddleOCR 2.x/3.x 支持的调优参数名差异很大：只要有一个参数不被认识就抛
+    ``ValueError: Unknown argument: xxx``，旧实现会因此【整套调优配置作废】、
+    回退到最慢的 safe 配置（实测 67 秒/页）。这里逐个剔除未知参数后重试，
+    该版本支持的所有加速项（mkldnn、边长限制等）全部保留下来。
+
+    非「未知参数」类异常（模型下载失败、mkldnn 运行时不兼容等）不吞，
+    直接向上抛，由调用方走安全配置兜底。
+    """
+    from paddleocr import PaddleOCR  # 延迟导入：未安装 paddle 时其它接口不受影响
+
+    args = dict(kwargs)
+    for _ in range(len(args) + 1):
+        try:
+            return PaddleOCR(**args)
+        except Exception as exc:
+            match = re.search(
+                r"Unknown argument[: ]+['\"]?([A-Za-z_][A-Za-z0-9_]*)", str(exc)
+            )
+            if not match or match.group(1) not in args:
+                raise  # 不是参数兼容问题 → 交给上层兜底
+            bad = match.group(1)
+            args.pop(bad, None)
+            print(f"[ocr] 当前版本不支持参数 {bad}，剔除后重试（其余调优项保留）")
+    raise RuntimeError("PaddleOCR 初始化失败：未知参数无法剔除干净")
+
+
 def _create_ocr(lang: str):
     """新建一个 PaddleOCR 实例（调优参数 → 安全配置 → 默认模型 三级兜底）。
 
@@ -112,61 +141,49 @@ def _create_ocr(lang: str):
     """
     from paddleocr import PaddleOCR  # 延迟导入：未安装 paddle 时其它接口不受影响
 
-    # ===== 性能调优参数（2核4G 小内存服务器实测配置）=====
+    # 模型名显式指定（lang 此时会被忽略，韩文必须用韩文专用 rec 模型）
+    model_kwargs = dict(
+        text_detection_model_name=OCR_DET_MODEL,
+        text_recognition_model_name=_KOREAN_MOBILE_REC if lang == "korean" else _MOBILE_REC,
+    )
+    # ===== 性能调优参数（2核4G 小内存服务器）=====
     # - enable_mkldnn=True：启用 MKLDNN 加速 CPU 推理
-    # - rec_batch_num=1：识别批大小压到 1，内存峰值最低（漫画逐行识别足够）
+    # - 识别批大小压到 1：内存峰值最低（漫画逐行识别足够）
+    # - 检测边长 OCR_DET_SIDE_LEN（默认 960）：长图 720x5000 不再按默认
+    #   4000 缩放推理，提速且省内存
     # - use_textline_orientation=False：漫画文字固定正向，跳过方向分类省时省内存
-    #   （PaddleOCR 3.x 已用此参数取代 use_angle_cls；两者同时传会抛
-    #    ValueError: mutually exclusive，导致整套调优参数初始化失败、回退最慢配置）
-    # - cpu_math_library_num_threads=2：CPU 数学库线程数对齐 2 核
-    # - det_limit_side_len=OCR_DET_SIDE_LEN（默认 960）：大图缩放控内存
+    #   （3.x 已取代 use_angle_cls；两者同时传会 mutually exclusive）
+    # - 参数名 2.x/3.x 差异极大：3.x 用 text_det_limit_side_len /
+    #   text_recognition_batch_size，2.x 用 det_limit_side_len / rec_batch_num；
+    #   两套都传，由 _build_ocr_adaptive 剔除当前版本不认识的，各版本都拿到
+    #   全套加速项（不再因一个旧参数让整套调优作废、回退最慢配置）
     tuned_kwargs = dict(
         lang=lang,
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
         enable_mkldnn=True,
-        rec_batch_num=1,
-        cpu_math_library_num_threads=2,
+        text_det_limit_side_len=OCR_DET_SIDE_LEN,
+        text_recognition_batch_size=1,
         det_limit_side_len=OCR_DET_SIDE_LEN,
+        rec_batch_num=1,
+        **model_kwargs,
     )
-    # 兜底安全配置：调优参数在当前 paddle 版本不可用（初始化报错）时回退，
-    # mkldnn 关闭走纯 CPU 算子（paddle 3.3.1 onednn 存在兼容 bug 的场景）
+    # 兜底安全配置：调优参数本身引发运行时异常时才回退（mkldnn 关闭）
     safe_kwargs = dict(
         lang=lang,
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
         enable_mkldnn=False,
+        **model_kwargs,
     )
     try:
-        if lang == "korean":
-            # 韩文：两个模型名都显式指定（lang 此时会被忽略，不能依赖它选 rec）
-            return PaddleOCR(
-                text_detection_model_name=OCR_DET_MODEL,
-                text_recognition_model_name=_KOREAN_MOBILE_REC,
-                **tuned_kwargs,
-            )
-        return PaddleOCR(
-            text_detection_model_name=OCR_DET_MODEL,
-            text_recognition_model_name=_MOBILE_REC,
-            **tuned_kwargs,
-        )
+        return _build_ocr_adaptive(tuned_kwargs)
     except Exception as exc:
-        # 兜底：调优参数不可用时回退安全配置（保证功能不中断）
-        print(f"[ocr] 调优参数初始化失败，回退安全配置: {type(exc).__name__}: {exc}")
+        print(f"[ocr] 调优配置初始化失败，回退安全配置: {type(exc).__name__}: {exc}")
         try:
-            if lang == "korean":
-                return PaddleOCR(
-                    text_detection_model_name=OCR_DET_MODEL,
-                    text_recognition_model_name=_KOREAN_MOBILE_REC,
-                    **safe_kwargs,
-                )
-            return PaddleOCR(
-                text_detection_model_name=OCR_DET_MODEL,
-                text_recognition_model_name=_MOBILE_REC,
-                **safe_kwargs,
-            )
+            return _build_ocr_adaptive(safe_kwargs)
         except Exception as exc2:
             print(f"[ocr] Mobile 模型初始化失败，回退默认模型: {type(exc2).__name__}: {exc2}")
             return PaddleOCR(**safe_kwargs)
