@@ -718,6 +718,18 @@ def create_translation_task(
                 result = []
             return {"task_id": task.id, "status": "done", "result": result}
         if task.status in ("queued", "processing"):
+            # 孤儿任务防御：processing 超过 10 分钟（正常单页全程 ≤1 分钟）视为
+            # 执行中崩溃/重启被晾，重置回队列继续跑，用户不必永久等「翻译中」
+            if (
+                task.status == "processing"
+                and task.updated_at is not None
+                and (datetime.utcnow() - task.updated_at).total_seconds() > 600
+            ):
+                task.status = "queued"
+                task.error = None
+                db.commit()
+                db.refresh(task)
+                return {"task_id": task.id, "status": "queued"}
             # 幂等：直接返回同一 task_id，绝不重复入队；顺手补上 Key 与组标识
             # （旧前端提交的任务没有 batch_id，新前端重进页面时补齐即可凑组）
             # 预热任务（系统 user_id=0）正被用户等待 → 归属到该用户，调度优先级随之提升

@@ -1722,9 +1722,41 @@ def _worker_tick() -> bool:
     return False
 
 
+def _recover_stuck_tasks() -> None:
+    """启动恢复：把遗留的 processing 任务重置回 queued（孤儿任务自愈）。
+
+    服务重启/崩溃时，正在执行的任务会停在 processing——worker 重启后只取
+    queued，这些任务永远没人处理，用户端一直显示「翻译中」（实测重启多次后
+    任务卡一天）。本 worker 是全局唯一单线程，启动瞬间不可能有任务真的在跑，
+    全部安全重置。attempts 保留（崩溃重试计数不归零，防无限循环）。
+    """
+    from main import SessionLocal
+
+    db = SessionLocal()
+    try:
+        TranslationTask = _load_task_model()
+        stuck = (
+            db.query(TranslationTask)
+            .filter(TranslationTask.status == "processing")
+            .all()
+        )
+        if not stuck:
+            return
+        for t in stuck:
+            t.status = "queued"  # attempts 保留：失败重试计数不归零
+        db.commit()
+        print(f"[worker] 启动恢复：{len(stuck)} 个遗留 processing 任务已重置回队列")
+    finally:
+        db.close()
+
+
 def _worker_loop() -> None:
     """单 worker 主循环：串行消费数据库队列，空队列时小睡。绝不并发跑 OCR。"""
     print("[worker] 翻译任务 worker 已启动（单页串行模式：一张一张翻译）")
+    try:
+        _recover_stuck_tasks()
+    except Exception as exc:
+        print(f"[worker] 启动恢复失败（不影响主循环）: {type(exc).__name__}: {exc}")
     while True:
         try:
             executed = _worker_tick()
