@@ -1579,10 +1579,12 @@ def review_comic(
             )
             db.commit()
             db.refresh(target)  # 刷新 relationship，让返回的章节列表包含新章
-            # 翻译预热：新章节逐页排队后台预翻译，用户打开时命中缓存秒出
-            # （仅投稿选了「需要 AI 翻译」才预热；append 时 1479 行已同步该标志）
+            # 翻译预热：只预热本次新增的章节（added_chapters），仅投稿选了
+            # 「需要 AI 翻译」才预热。绝不传 target.chapters（整本）：
+            # 老章节（预热上线前发布）没有任务记录会被整本重新入队，排在
+            # 新章节前面，一夜串行翻不完 → 用户打开新章节没秒开（实测）
             enqueue_pretranslate_tasks(
-                target.id, target.chapters, db, target.need_translation
+                target.id, added_chapters, db, target.need_translation
             )
             return {
                 "message": f"已通过！{len(added_chapters)} 个章节已追加到《{target.title}》",
